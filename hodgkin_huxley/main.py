@@ -57,7 +57,10 @@ class HH_layer(nn.Module):
 		self.tau_width_h = nn.Parameter(torch.randn(out_features))
 		self.tau_width_n = nn.Parameter(torch.randn(out_features))
 
-		self.zero_states()
+		self.register_buffer("v", torch.zeros(self.out_features))
+		self.register_buffer("m", self.p_inf(self.v, self.v_half_m, self.k_m).detach())
+		self.register_buffer("h", self.p_inf(self.v, self.v_half_h, self.k_h).detach())
+		self.register_buffer("n", self.p_inf(self.v, self.v_half_n, self.k_n).detach())
 
 	@torch.no_grad()
 	def zero_states(self, mode: str = "p_inf", v: float | torch.Tensor = 0.0):
@@ -96,7 +99,14 @@ class HH_layer(nn.Module):
 		tau_width_p = nn.functional.softplus(tau_width) + 1e-9
 		return tau_min_p + tau_amp_p * torch.exp(-((v - tau_center) ** 2) / tau_width_p)
 
-	def forward(self, in_spikes, delta_t: float = 1e-3):
+	def forward(self, in_spikes, delta_t: float = 1e-3, detach_state: bool = True):
+		if detach_state:
+			with torch.no_grad():
+				self.v.copy_(self.v.detach())
+				self.m.copy_(self.m.detach())
+				self.h.copy_(self.h.detach())
+				self.n.copy_(self.n.detach())
+
 		m_inf = self.p_inf(self.v, self.v_half_m, self.k_m)
 		tau_m = self.tau_of(self.v, self.tau_min_m, self.tau_amp_m, self.v_half_m, self.tau_width_m)
 
@@ -125,3 +135,137 @@ class HH_layer(nn.Module):
 
 		out_spikes = self.l2(self.v)
 		return out_spikes
+
+
+# ======================================================================================================================
+import torch
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import torch.nn.functional as F
+
+# --- Constants ---
+NUM_CLASSES = 10
+IMAGE_SIZE = 28 * 28  # Flattened MNIST image
+
+# --- Transform ---
+transform = transforms.Compose([
+	transforms.ToTensor(),  # [1, 28, 28]
+	transforms.Lambda(lambda x: x.view(-1))  # Flatten to [784]
+])
+
+
+# --- One-hot encoding helper ---
+def one_hot_encode(labels, num_classes=NUM_CLASSES):
+	return F.one_hot(labels, num_classes=num_classes).float()
+
+
+# --- Custom collate function (no batching) ---
+def collate_fn(batch):
+	# Each batch is actually one sample when batch_size=1
+	(image, label) = batch[0]
+	label = one_hot_encode(torch.tensor(label), NUM_CLASSES)  # [10]
+	return image, label
+
+
+# --- Dataloaders (always single sample) ---
+def get_mnist_single_dataloaders():
+	train_dataset = datasets.MNIST(root='data', train=True, download=True, transform=transform)
+	test_dataset = datasets.MNIST(root='data', train=False, download=True, transform=transform)
+
+	train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
+	test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+
+	return train_loader, test_loader
+
+
+train_dataloader, test_dataloader = get_mnist_single_dataloaders()
+# ======================================================================================================================
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import time
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+middle_size = 64
+num_timesteps = 100
+num_epochs = 1
+delta_t = 1e-3
+
+model = nn.Sequential(
+	HH_layer(in_features=784, out_features=middle_size),
+	HH_layer(in_features=middle_size, out_features=middle_size),
+	HH_layer(in_features=middle_size, out_features=10),
+).to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+train_losses, test_losses = [], []
+garbate_losses = []
+
+for e in range(num_epochs):
+	# Train
+	model.train()
+	train_loss = 0
+	for (image, label) in tqdm(train_dataloader, total=len(train_dataloader), desc=f"Train - E{e + 1}"):
+		image, label = image.to(device), label.to(device)
+		temp_loss = 0
+		for layer in model:
+			layer.zero_states()
+
+		for t in range(num_timesteps):
+			model_out = model(image)
+			loss = nn.functional.mse_loss(model_out, label)
+			temp_loss += loss.item()
+			loss.backward()
+
+		with torch.no_grad():
+			for param in model.parmeters():
+				param.grad.div_(num_timesteps)
+
+		optimizer.step()
+		optimizer.zero_grad()
+		temp_loss /= num_timesteps
+		train_loss += temp_loss
+		garbate_losses.append(temp_loss)
+
+	train_loss /= len(train_dataloader)
+	train_losses.append(train_loss)
+
+	# Test
+	model.eval()
+	test_loss = 0
+	for (image, label) in tqdm(test_dataloader, total=len(test_dataloader), desc=f"Test - E{e + 1}"):
+		with torch.no_grad():
+			image, label = image.to(device), label.to(device)
+			temp_loss = 0
+			for layer in model:
+				layer.zero_states()
+
+			for t in range(num_timesteps):
+				model_out = model(image)
+				loss = nn.functional.mse_loss(model_out, label)
+				temp_loss += loss.item()
+
+		optimizer.step()
+		optimizer.zero_grad()
+		temp_loss /= num_timesteps
+		train_loss += temp_loss
+
+	train_loss /= len(train_dataloader)
+	train_losses.append(train_loss)
+
+	# Showing stuff
+	plt.plot(train_losses, label="Train")
+	plt.plot(test_losses, label="Test")
+	plt.title("Loss")
+	plt.legend()
+	plt.show()
+
+	plt.plot(garbate_losses, label="Train")
+	plt.title("Train loss across time")
+	plt.legend()
+	plt.show()
+
+	time.sleep(0.1)
+	print(f"E{e + 1} - Train: {train_loss}, Test: {test_loss}")
+	time.sleep(0.1)
