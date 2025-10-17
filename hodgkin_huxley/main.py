@@ -59,11 +59,6 @@ class HH_layer(nn.Module):
 		self.tau_width_h = nn.Parameter(torch.randn(out_features))
 		self.tau_width_n = nn.Parameter(torch.randn(out_features))
 
-		# self.register_buffer("v", torch.zeros(self.out_features))
-		# self.register_buffer("m", self.p_inf(self.v, self.v_half_m, self.k_m).detach())
-		# self.register_buffer("h", self.p_inf(self.v, self.v_half_h, self.k_h).detach())
-		# self.register_buffer("n", self.p_inf(self.v, self.v_half_n, self.k_n).detach())
-
 		self.v, self.m, self.h, self.n = None, None, None, None
 		self.zero_states()
 
@@ -165,28 +160,29 @@ import matplotlib.pyplot as plt
 import time
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-middle_size = 64
-num_timesteps = 100
+middle_size = 128
+num_timesteps = 1000
 num_epochs = 1
 delta_t = 1e-3
 
 model = nn.Sequential(
-	HH_layer(in_features=784, out_features=middle_size),
-	HH_layer(in_features=middle_size, out_features=middle_size),
-	HH_layer(in_features=middle_size, out_features=10),
+	HH_layer(in_features=784, out_features=middle_size, delta_t=delta_t),
+	HH_layer(in_features=middle_size, out_features=middle_size, delta_t=delta_t),
+	HH_layer(in_features=middle_size, out_features=10, delta_t=delta_t),
 ).to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
 train_losses, test_losses = [], []
-garbate_losses = []
+ema_loss = 0
+ema_decay = 0.99
+ema_losses = []
 
 for e in range(num_epochs):
 	# Train
 	model.train()
 	train_loss = 0
-	for (image, label) in tqdm(train_dataloader, total=len(train_dataloader), desc=f"Train - E{e + 1}"):
+	for _, (image, label) in tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Train - E{e + 1}"):
 		image, label = image.to(device), label.to(device)
 		temp_loss = 0
 		optimizer.zero_grad()
@@ -195,6 +191,7 @@ for e in range(num_epochs):
 
 		for t in range(num_timesteps):
 			model_out = model(image)
+			model_out = nn.functional.softmax(model_out, -1)
 			loss = nn.functional.mse_loss(model_out, label)
 			temp_loss += loss.item()
 			loss.backward()
@@ -211,7 +208,14 @@ for e in range(num_epochs):
 		optimizer.step()
 		temp_loss /= num_timesteps
 		train_loss += temp_loss
-		garbate_losses.append(temp_loss)
+		ema_loss = ema_loss * ema_decay + temp_loss * (1 - ema_decay)
+		ema_losses.append(ema_loss)
+
+		if (_ + 1) % 100 == 0:
+			plt.plot(ema_losses, label="EMA Loss")
+			plt.title(f"EMA train loss, {e * len(train_dataloader) + _ + 1}")
+			plt.legend()
+			plt.show()
 
 	train_loss /= len(train_dataloader)
 	train_losses.append(train_loss)
@@ -228,6 +232,7 @@ for e in range(num_epochs):
 
 			for t in range(num_timesteps):
 				model_out = model(image)
+				model_out = nn.functional.softmax(model_out, -1)
 				loss = nn.functional.mse_loss(model_out, label)
 				temp_loss += loss.item()
 
@@ -243,11 +248,6 @@ for e in range(num_epochs):
 	plt.plot(train_losses, label="Train")
 	plt.plot(test_losses, label="Test")
 	plt.title("Loss")
-	plt.legend()
-	plt.show()
-
-	plt.plot(garbate_losses, label="Train")
-	plt.title("Train loss across time")
 	plt.legend()
 	plt.show()
 
