@@ -172,16 +172,16 @@ class SNN(nn.Module):
 		return x
 
 
-n_in = 10
-n_hidden = 32
-n_out = 10
+n_in = 100
+n_hidden = 128
+n_out = 100
 
 rand_in = torch.rand(n_in)
 rand_out = torch.rand(n_out).round_()
 
 model = SNN(n_in, n_hidden, n_out)
 
-optimizer = torch.optim.AdamW(model.parameters())
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
 
 num_timesteps = 100
 num_epochs = 100
@@ -192,31 +192,46 @@ for e in tqdm(range(num_epochs), total=num_epochs):
 	model.zero_states()
 	model.zero_grad()
 
-	average_output = torch.zeros(n_out)
-
 	for t in range(num_timesteps):
 		spike_input = torch.bernoulli(rand_in)
 		model_out = model(spike_input)
-		average_output = average_output + model_out
+		loss = nn.functional.mse_loss(model_out, rand_out)
+		losses.append(loss.item())
+		loss.backward()
+		model.detach_states()
 
-	average_output = average_output / num_timesteps
-	loss = nn.functional.mse_loss(average_output, rand_out)
-	loss.backward()
-	losses.append(loss.item())
+	with torch.no_grad():
+		for param in model.parameters():
+			param.div_(num_timesteps)
+
 	optimizer.step()
 
 import matplotlib.pyplot as plt
 
 plt.plot(losses, label="Loss")
 plt.legend()
-plt.title("Loss")
+plt.title("Train")
 plt.show()
 
+example_losses = []
+
 with torch.no_grad():
+	average_out = torch.zeros(n_out)
+
 	for t in tqdm(range(num_timesteps), total=num_timesteps):
 		spike_input = torch.bernoulli(rand_in)
 		model_out = model(spike_input)
-
+		average_out += model_out
 		loss = nn.functional.mse_loss(model_out, rand_out)
+		example_losses.append(loss.item())
 
-		print(f"S: {model_out}, L: {loss.item()}")
+	average_out /= num_timesteps
+
+print(f"Gotten: {average_out}")
+print(f"Expect: {rand_out}")
+print(f"Loss: {nn.functional.mse_loss(average_out, rand_out)}")
+
+plt.plot(example_losses, label="Loss")
+plt.legend()
+plt.title("Inspect")
+plt.show()
