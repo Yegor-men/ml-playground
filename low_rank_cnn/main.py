@@ -73,7 +73,7 @@ base_model = nn.Sequential(
 ).to(device)
 
 low_rank_model = nn.Sequential(
-    nn.Conv2d(1, 16, 5),
+    LowRankConv2d(1, 16, 5),
     nn.SiLU(),
     LowRankConv2d(16, 32, 5),
     nn.SiLU(),
