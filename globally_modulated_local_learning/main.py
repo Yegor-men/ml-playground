@@ -16,76 +16,72 @@ class Layer(nn.Module):
             nn.SiLU(),
         )
 
-        # n2_upstream: takes layer input x → predicts the true label (one-hot)
-        # This approximates "what the label should be" from everything upstream + this point
+        # Both n2s output to the SAME arbitrary dimension (256 as you asked)
+        # They are NEVER supervised with the label or final output.
+        approx_dim = 256
         self.n2_upstream = nn.Sequential(
             nn.Linear(in_features, 4 * in_features),
             nn.SiLU(),
-            nn.Linear(4 * in_features, 10)
+            nn.Linear(4 * in_features, approx_dim)
         )
-
-        # n2_downstream: takes layer output y → predicts the final model output
-        # This approximates "what the rest of the network will output" from this point onward
         self.n2_downstream = nn.Sequential(
             nn.Linear(out_features, 4 * out_features),
             nn.SiLU(),
-            nn.Linear(4 * out_features, 10)
+            nn.Linear(4 * out_features, approx_dim)
         )
 
-        # Storage for manual gradient flow
+        # Storage only for manual gradient flow
         self.last_input = None
         self.n1_output = None
 
     def forward(self, x):
         self.last_input = x
         self.n1_output = self.n1(x)
-        return self.n1_output.detach()  # break global graph
+        return self.n1_output.detach()  # break any global graph
 
-    def update_layer(self, global_target, global_final):
+    def update_layer(self, real_loss):
         """
-        1. Train the two critics directly:
-           - n2_upstream(x) ← global_target (label)
-           - n2_downstream(y) ← global_final (actual model output)
-        2. Compute predicted_loss = MSE(n2_upstream(x), n2_downstream(y))
-           This becomes a surrogate for the true global MSE(final, label)
-        3. Backprop the surrogate gradient ONLY through n1 (via detached y)
+        EXACTLY as you described:
+        - n2_upstream(x) and n2_downstream(y) produce vectors of size 256
+        - pred_loss = MSE between those two vectors
+        - Train the n2s ONLY by making pred_loss match the true global loss
+          (no label, no final output ever fed to them)
+        - Then compute derivative of that SAME pred_loss w.r.t. y (detached)
+          and push it back to n1 only
         """
-        # === Critic supervision (makes predicted loss match true loss) ===
-        upstream_approx = self.n2_upstream(self.last_input)
-        downstream_approx = self.n2_downstream(self.n1_output.detach())
+        # === 1. Critics learn to predict the true loss via their vector difference ===
+        upstream_vec = self.n2_upstream(self.last_input)
+        downstream_vec = self.n2_downstream(self.n1_output.detach())  # detached so n1 gets no gradient here
 
-        upstream_loss = nn.functional.mse_loss(upstream_approx, global_target.detach())
-        upstream_loss.backward()
+        pred_loss = nn.functional.mse_loss(
+            upstream_vec, downstream_vec, reduction='none'
+        ).mean(dim=1, keepdim=True)
 
-        downstream_loss = nn.functional.mse_loss(downstream_approx, global_final.detach())
-        downstream_loss.backward()
+        # This is the ONLY supervision the n2s ever get
+        critic_loss = nn.functional.mse_loss(pred_loss, real_loss.detach())
+        critic_loss.backward()  # updates ONLY n2_upstream + n2_downstream
 
-        # === Surrogate gradient for n1 ===
+        # === 2. Surrogate gradient for n1 (exactly the derivative you asked for) ===
         if self.n1_output is not None:
             detached_y = self.n1_output.detach().requires_grad_(True)
 
-            # Recompute with fresh forward (params are still the same)
-            upstream_val = self.n2_upstream(self.last_input)
-            downstream_for_grad = self.n2_downstream(detached_y)
+            # Recompute fresh (params have already been updated by critic)
+            upstream_vec = self.n2_upstream(self.last_input)
+            downstream_vec = self.n2_downstream(detached_y)
 
-            # predicted_loss = MSE(upstream_view_of_label, downstream_view_of_final)
-            # This is exactly the split you asked for
-            pred_loss = nn.functional.mse_loss(
-                upstream_val,
-                downstream_for_grad,
-                reduction='none'
+            pred_loss_for_grad = nn.functional.mse_loss(
+                upstream_vec, downstream_vec, reduction='none'
             ).mean(dim=1, keepdim=True)
 
-            # Gradient of predicted loss w.r.t. layer output y
             grad_wrt_y = torch.autograd.grad(
-                outputs=pred_loss,
+                outputs=pred_loss_for_grad,
                 inputs=detached_y,
-                grad_outputs=torch.ones_like(pred_loss),
+                grad_outputs=torch.ones_like(pred_loss_for_grad),
                 create_graph=False,
                 retain_graph=False
             )[0]
 
-            # Apply surrogate gradient to n1 (no global graph)
+            # This is the only gradient n1 ever sees
             self.n1_output.backward(grad_wrt_y)
 
         # Cleanup
@@ -96,25 +92,23 @@ class Layer(nn.Module):
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.l1 = Layer(784, 256)
-        self.l2 = Layer(256, 256)
-        self.l3 = Layer(256, 10)  # final layer outputs classification logits
+        self.net = nn.Sequential(
+            Layer(784, 256),
+            Layer(256, 256),
+            Layer(256, 10),
+        )
 
     def forward(self, x):
-        x = self.l1(x)
-        x = self.l2(x)
-        x = self.l3(x)
-        return x
+        return self.net(x)
 
-    def update_params(self, global_target, global_final):
-        # Each layer gets the SAME global target (label) and global final output
-        # No global backprop anywhere — exactly as you wanted
-        self.l1.update_layer(global_target, global_final)
-        self.l2.update_layer(global_target, global_final)
-        self.l3.update_layer(global_target, global_final)
+    def update_params(self, real_loss):
+        # Each layer gets ONLY the true global loss scalar (per sample)
+        # No labels, no final outputs ever passed
+        for layer in self.net:
+            layer.update_layer(real_loss)
 
 
-# ================== Data (classification, one-hot) ==================
+# ================== Data (classification, one-hot — unchanged) ==================
 def get_mnist_dataloaders(batch_size=100):
     os.makedirs('data', exist_ok=True)
     transform = transforms.Compose([
@@ -164,17 +158,17 @@ for E in range(num_epochs):
 
         model_output = model(image)
 
-        # True global loss (exactly as you asked — this is the "actual mistake")
+        # True global loss — this is the ONLY place the label is used in the whole training loop
         real_loss = nn.functional.mse_loss(model_output, label, reduction='none').mean(dim=1, keepdim=True)
 
-        # Accuracy
+        # Accuracy (for monitoring only)
         _, predicted = torch.max(model_output, 1)
         _, true_labels = torch.max(label, 1)
         epoch_train_total += label.size(0)
         epoch_train_correct += (predicted == true_labels).sum().item()
 
-        # Local per-layer update (n2_upstream + n2_downstream + surrogate on n1)
-        model.update_params(label, model_output)
+        # Local update — n2s get ONLY real_loss, nothing else
+        model.update_params(real_loss)
 
         optimizer.step()
 
