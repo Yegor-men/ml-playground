@@ -21,6 +21,14 @@ class LossStats:
     neg_sim: float
 
 
+@dataclass
+class RetrievalStats:
+    top1_same: float
+    top3_any_same: float
+    mrr: float
+    mean_same_rank: float
+
+
 class BalancedClassBatchSampler(Sampler[list[int]]):
     def __init__(
         self,
@@ -126,7 +134,7 @@ def get_omniglot_dataloaders(
     eval_batches: int,
     num_workers: int,
     seed: int,
-) -> tuple[DataLoader, DataLoader, datasets.Omniglot]:
+) -> tuple[DataLoader, DataLoader, datasets.Omniglot, datasets.Omniglot]:
     transform = transforms.Compose(
         [
             transforms.Resize(
@@ -178,7 +186,7 @@ def get_omniglot_dataloaders(
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
-    return train_loader, eval_loader, eval_dataset
+    return train_loader, eval_loader, train_dataset, eval_dataset
 
 
 def pairwise_cosine_matrix_loss(
@@ -227,6 +235,41 @@ def mean_stats(stats: list[LossStats]) -> LossStats:
         neg_loss=sum(stat.neg_loss for stat in stats) / count,
         pos_sim=sum(stat.pos_sim for stat in stats) / count,
         neg_sim=sum(stat.neg_sim for stat in stats) / count,
+    )
+
+
+def retrieval_stats_from_embeddings(embeddings: torch.Tensor, labels: torch.Tensor) -> RetrievalStats:
+    similarities = embeddings @ embeddings.T
+    similarities.fill_diagonal_(float("-inf"))
+
+    same_class = labels[:, None].eq(labels[None, :])
+    same_class.fill_diagonal_(False)
+
+    sorted_indices = similarities.argsort(dim=1, descending=True)
+    sorted_same = same_class.gather(dim=1, index=sorted_indices)
+    has_same = sorted_same.any(dim=1)
+    first_same_rank = sorted_same.to(torch.float32).argmax(dim=1).to(torch.float32) + 1.0
+    missing_rank = torch.full_like(first_same_rank, fill_value=float(embeddings.size(0)))
+    first_same_rank = torch.where(has_same, first_same_rank, missing_rank)
+
+    top3_width = min(3, max(1, embeddings.size(0) - 1))
+    reciprocal_rank = torch.where(has_same, 1.0 / first_same_rank, torch.zeros_like(first_same_rank))
+
+    return RetrievalStats(
+        top1_same=float(sorted_same[:, 0].to(torch.float32).mean().cpu()),
+        top3_any_same=float(sorted_same[:, :top3_width].any(dim=1).to(torch.float32).mean().cpu()),
+        mrr=float(reciprocal_rank.mean().cpu()),
+        mean_same_rank=float(first_same_rank.mean().cpu()),
+    )
+
+
+def mean_retrieval_stats(stats: list[RetrievalStats]) -> RetrievalStats:
+    count = len(stats)
+    return RetrievalStats(
+        top1_same=sum(stat.top1_same for stat in stats) / count,
+        top3_any_same=sum(stat.top3_any_same for stat in stats) / count,
+        mrr=sum(stat.mrr for stat in stats) / count,
+        mean_same_rank=sum(stat.mean_same_rank for stat in stats) / count,
     )
 
 
@@ -281,10 +324,11 @@ def evaluate(
     positive_weight: float,
     negative_weight: float,
     epoch: int,
-) -> dict[str, LossStats]:
+) -> tuple[dict[str, LossStats], dict[str, RetrievalStats]]:
     from tqdm import tqdm
 
-    history = {name: [] for name in models}
+    loss_history = {name: [] for name in models}
+    retrieval_history = {name: [] for name in models}
     for model in models.values():
         model.eval()
 
@@ -300,15 +344,22 @@ def evaluate(
                 positive_weight=positive_weight,
                 negative_weight=negative_weight,
             )
-            history[name].append(stats)
+            embeddings = F.normalize(0.5 * (left + right), p=2, dim=-1)
+            retrieval_stats = retrieval_stats_from_embeddings(embeddings, labels)
+            loss_history[name].append(stats)
+            retrieval_history[name].append(retrieval_stats)
 
-    return {name: mean_stats(stats) for name, stats in history.items()}
+    return (
+        {name: mean_stats(stats) for name, stats in loss_history.items()},
+        {name: mean_retrieval_stats(stats) for name, stats in retrieval_history.items()},
+    )
 
 
 def append_history(
     history: dict[str, dict[str, list[float]]],
     train_stats: dict[str, LossStats],
     eval_stats: dict[str, LossStats],
+    retrieval_stats: dict[str, RetrievalStats],
 ):
     for name in train_stats:
         history[name]["train_loss"].append(train_stats[name].loss)
@@ -317,6 +368,10 @@ def append_history(
         history[name]["train_neg_sim"].append(train_stats[name].neg_sim)
         history[name]["eval_pos_sim"].append(eval_stats[name].pos_sim)
         history[name]["eval_neg_sim"].append(eval_stats[name].neg_sim)
+        history[name]["eval_top1_same"].append(retrieval_stats[name].top1_same)
+        history[name]["eval_top3_any_same"].append(retrieval_stats[name].top3_any_same)
+        history[name]["eval_mrr"].append(retrieval_stats[name].mrr)
+        history[name]["eval_mean_same_rank"].append(retrieval_stats[name].mean_same_rank)
 
 
 def plot_loss_curves(
@@ -329,12 +384,16 @@ def plot_loss_curves(
 
     epochs = range(1, len(next(iter(history.values()))["train_loss"]) + 1)
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
     panels = [
         (axes[0, 0], "train_loss", "Training loss"),
         (axes[0, 1], "eval_loss", "Evaluation loss"),
         (axes[1, 0], "eval_pos_sim", "Evaluation positive cosine similarity"),
         (axes[1, 1], "eval_neg_sim", "Evaluation negative cosine similarity"),
+        (axes[0, 2], "eval_top1_same", "Eval-batch retrieval top-1 same-class"),
+        (axes[0, 3], "eval_top3_any_same", "Eval-batch retrieval top-3 has same-class"),
+        (axes[1, 2], "eval_mrr", "Eval-batch retrieval mean reciprocal rank"),
+        (axes[1, 3], "eval_mean_same_rank", "Eval-batch retrieval mean first same-class rank"),
     ]
 
     for ax, metric, title in panels:
@@ -363,7 +422,7 @@ def collect_diagnostic_batch(
     classes_per_batch: int,
     samples_per_class: int,
     seed: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     sampler = BalancedClassBatchSampler(
         labels=get_omniglot_labels(dataset),
         classes_per_batch=classes_per_batch,
@@ -373,17 +432,19 @@ def collect_diagnostic_batch(
     )
     indices = next(iter(sampler))
     images, labels = zip(*(dataset[index] for index in indices))
-    return torch.stack(list(images)), torch.tensor(labels, dtype=torch.long)
+    return torch.stack(list(images)), torch.tensor(labels, dtype=torch.long), torch.tensor(indices, dtype=torch.long)
 
 
 @torch.no_grad()
-def plot_nearest_neighbor_diagnostics(
+def plot_cross_split_nearest_neighbor_diagnostics(
     model: TwinGlyphModel,
     name: str,
-    dataset: datasets.Omniglot,
+    train_dataset: datasets.Omniglot,
+    eval_dataset: datasets.Omniglot,
     device: torch.device,
     output_dir: Path,
-    classes: int,
+    train_classes: int,
+    eval_classes: int,
     samples_per_class: int,
     query_count: int,
     neighbor_count: int,
@@ -394,52 +455,74 @@ def plot_nearest_neighbor_diagnostics(
     import matplotlib.pyplot as plt
 
     model.eval()
-    images, labels = collect_diagnostic_batch(
-        dataset=dataset,
-        classes_per_batch=classes,
+    eval_images, eval_labels, eval_indices = collect_diagnostic_batch(
+        dataset=eval_dataset,
+        classes_per_batch=eval_classes,
         samples_per_class=samples_per_class,
         seed=seed,
     )
-    embeddings = model.embed(images.to(device)).cpu()
-    similarities = embeddings @ embeddings.T
-    nearest_similarities = similarities.clone()
-    nearest_similarities.fill_diagonal_(float("-inf"))
+    train_images, train_labels, train_indices = collect_diagnostic_batch(
+        dataset=train_dataset,
+        classes_per_batch=train_classes,
+        samples_per_class=samples_per_class,
+        seed=seed + 1,
+    )
+
+    gallery_images = torch.cat([eval_images, train_images], dim=0)
+    gallery_labels = torch.cat([eval_labels, train_labels], dim=0)
+    gallery_indices = torch.cat([eval_indices, train_indices], dim=0)
+    gallery_is_eval = torch.cat(
+        [
+            torch.ones(len(eval_images), dtype=torch.bool),
+            torch.zeros(len(train_images), dtype=torch.bool),
+        ],
+        dim=0,
+    )
+
+    query_embeddings = model.embed(eval_images.to(device)).cpu()
+    gallery_embeddings = model.embed(gallery_images.to(device)).cpu()
+    similarities = query_embeddings @ gallery_embeddings.T
+
+    same_eval_example = gallery_is_eval[None, :] & gallery_indices[None, :].eq(eval_indices[:, None])
+    similarities = similarities.masked_fill(same_eval_example, float("-inf"))
 
     rng = random.Random(seed)
-    query_indices = rng.sample(range(len(images)), min(query_count, len(images)))
+    query_indices = rng.sample(range(len(eval_images)), min(query_count, len(eval_images)))
 
-    columns = min(neighbor_count, len(images) - 1) + 1
+    columns = min(neighbor_count, len(gallery_images) - 1) + 1
     rows = len(query_indices)
     fig, axes = plt.subplots(rows, columns, figsize=(columns * 1.55, max(2.0, rows * 1.75)))
     if rows == 1:
         axes = axes[None, :]
 
     for row, query_index in enumerate(query_indices):
-        neighbor_scores, neighbor_indices = nearest_similarities[query_index].topk(columns - 1)
-        shown_images = [(query_index, 1.0)]
+        neighbor_scores, neighbor_indices = similarities[query_index].topk(columns - 1)
+        shown_images = [("query", query_index, 1.0)]
         shown_images.extend(
-            (int(image_index), float(score))
+            ("neighbor", int(image_index), float(score))
             for image_index, score in zip(neighbor_indices.tolist(), neighbor_scores.tolist())
         )
 
-        query_label = int(labels[query_index])
-        for col, (image_index, score) in enumerate(shown_images):
+        query_label = int(eval_labels[query_index])
+        for col, (kind, image_index, score) in enumerate(shown_images):
             ax = axes[row, col]
-            ax.imshow(images[image_index].squeeze(0), cmap="gray")
-            image_label = int(labels[image_index])
-            if col == 0:
-                title = f"query\nclass {image_label}"
+            if kind == "query":
+                ax.imshow(eval_images[image_index].squeeze(0), cmap="gray")
+                title = f"eval query\nclass {query_label}"
             else:
-                marker = "same" if image_label == query_label else "diff"
-                title = f"top {col} ({marker})\nclass {image_label}, cos {score:.2f}"
+                ax.imshow(gallery_images[image_index].squeeze(0), cmap="gray")
+                image_label = int(gallery_labels[image_index])
+                split = "eval" if bool(gallery_is_eval[image_index]) else "train"
+                marker = "same" if split == "eval" and image_label == query_label else "diff"
+                title = f"top {col} ({split}, {marker})\nclass {image_label}, cos {score:.2f}"
             ax.set_title(title, fontsize=8)
             ax.axis("off")
 
-    fig.suptitle(f"{name} EMA top-{columns - 1} eval nearest neighbors", fontsize=13)
+    fig.suptitle(f"{name} EMA eval queries vs mixed train+eval gallery", fontsize=13)
     fig.tight_layout()
     if save_plots:
         output_dir.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_dir / f"{name}_top_neighbors.png", dpi=170)
+        fig.savefig(output_dir / f"{name}_cross_split_neighbors.png", dpi=170)
     if show_plots:
         plt.show()
     else:
@@ -471,7 +554,8 @@ def get_args():
 
     diagnostics_group = parser.add_argument_group("Diagnostics")
     diagnostics_group.add_argument("--output_dir", type=Path, default=Path(__file__).resolve().parent / "outputs")
-    diagnostics_group.add_argument("--diagnostic_classes", type=int, default=8)
+    diagnostics_group.add_argument("--diagnostic_eval_classes", type=int, default=8)
+    diagnostics_group.add_argument("--diagnostic_train_classes", type=int, default=32)
     diagnostics_group.add_argument("--diagnostic_samples_per_class", type=int, default=4)
     diagnostics_group.add_argument("--diagnostic_queries", type=int, default=6)
     diagnostics_group.add_argument("--diagnostic_neighbors", type=int, default=10)
@@ -511,7 +595,7 @@ def main(args):
     print(f"Device: {device}")
     print(f"Batch shape: {args.classes_per_batch} classes x {args.samples_per_class} samples = {batch_size}")
 
-    train_loader, eval_loader, eval_dataset = get_omniglot_dataloaders(
+    train_loader, eval_loader, train_dataset, eval_dataset = get_omniglot_dataloaders(
         data_dir=args.data_dir,
         image_size=args.image_size,
         classes_per_batch=args.classes_per_batch,
@@ -544,6 +628,10 @@ def main(args):
             "train_neg_sim": [],
             "eval_pos_sim": [],
             "eval_neg_sim": [],
+            "eval_top1_same": [],
+            "eval_top3_any_same": [],
+            "eval_mrr": [],
+            "eval_mean_same_rank": [],
         }
         for name in models
     }
@@ -560,7 +648,7 @@ def main(args):
             negative_weight=args.negative_weight,
             epoch=epoch,
         )
-        eval_stats = evaluate(
+        eval_stats, retrieval_stats = evaluate(
             models=ema_models,
             eval_loader=eval_loader,
             device=device,
@@ -568,7 +656,7 @@ def main(args):
             negative_weight=args.negative_weight,
             epoch=epoch,
         )
-        append_history(history, train_stats, eval_stats)
+        append_history(history, train_stats, eval_stats, retrieval_stats)
         plot_loss_curves(
             history=history,
             output_dir=args.output_dir,
@@ -580,18 +668,22 @@ def main(args):
         for name in models:
             summary.append(
                 f"{name}: train={train_stats[name].loss:.4f}, eval={eval_stats[name].loss:.4f}, "
-                f"eval pos cos={eval_stats[name].pos_sim:.3f}, eval neg cos={eval_stats[name].neg_sim:.3f}"
+                f"eval pos cos={eval_stats[name].pos_sim:.3f}, eval neg cos={eval_stats[name].neg_sim:.3f}, "
+                f"top1={retrieval_stats[name].top1_same:.3f}, top3={retrieval_stats[name].top3_any_same:.3f}, "
+                f"mrr={retrieval_stats[name].mrr:.3f}, rank={retrieval_stats[name].mean_same_rank:.2f}"
             )
         print(f"Epoch {epoch}: " + " | ".join(summary))
 
     for name, model in ema_models.items():
-        plot_nearest_neighbor_diagnostics(
+        plot_cross_split_nearest_neighbor_diagnostics(
             model=model,
             name=name,
-            dataset=eval_dataset,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             device=device,
             output_dir=args.output_dir,
-            classes=args.diagnostic_classes,
+            train_classes=args.diagnostic_train_classes,
+            eval_classes=args.diagnostic_eval_classes,
             samples_per_class=args.diagnostic_samples_per_class,
             query_count=args.diagnostic_queries,
             neighbor_count=args.diagnostic_neighbors,
