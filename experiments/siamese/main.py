@@ -1,15 +1,40 @@
-import argparse
 import copy
 import random
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Sampler
 from torchvision import datasets, transforms
+from tqdm.auto import tqdm
+
+
+# Experiment configuration
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+IMAGE_SIZE = 64
+CLASSES_PER_BATCH = 16
+SAMPLES_PER_CLASS = 4
+TRAIN_BATCHES_PER_EPOCH = 300
+EVAL_BATCHES = 80
+NUM_WORKERS = 2
+EMBEDDING_DIM = 64
+NUM_EPOCHS = 20
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+EMA_DECAY = 0.999
+POSITIVE_WEIGHT = 0.5
+NEGATIVE_WEIGHT = 0.5
+DIAGNOSTIC_EVAL_CLASSES = 8
+DIAGNOSTIC_TRAIN_CLASSES = 32
+DIAGNOSTIC_SAMPLES_PER_CLASS = 4
+DIAGNOSTIC_QUERIES = 6
+DIAGNOSTIC_NEIGHBORS = 10
+SEED = 0
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -238,7 +263,10 @@ def mean_stats(stats: list[LossStats]) -> LossStats:
     )
 
 
-def retrieval_stats_from_embeddings(embeddings: torch.Tensor, labels: torch.Tensor) -> RetrievalStats:
+def retrieval_stats_from_embeddings(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+) -> RetrievalStats:
     similarities = embeddings @ embeddings.T
     similarities.fill_diagonal_(float("-inf"))
 
@@ -253,7 +281,11 @@ def retrieval_stats_from_embeddings(embeddings: torch.Tensor, labels: torch.Tens
     first_same_rank = torch.where(has_same, first_same_rank, missing_rank)
 
     top3_width = min(3, max(1, embeddings.size(0) - 1))
-    reciprocal_rank = torch.where(has_same, 1.0 / first_same_rank, torch.zeros_like(first_same_rank))
+    reciprocal_rank = torch.where(
+        has_same,
+        1.0 / first_same_rank,
+        torch.zeros_like(first_same_rank),
+    )
 
     return RetrievalStats(
         top1_same=float(sorted_same[:, 0].to(torch.float32).mean().cpu()),
@@ -284,8 +316,6 @@ def train_one_epoch(
     negative_weight: float,
     epoch: int,
 ) -> dict[str, LossStats]:
-    from tqdm import tqdm
-
     history = {name: [] for name in models}
     for model in models.values():
         model.train()
@@ -325,8 +355,6 @@ def evaluate(
     negative_weight: float,
     epoch: int,
 ) -> tuple[dict[str, LossStats], dict[str, RetrievalStats]]:
-    from tqdm import tqdm
-
     loss_history = {name: [] for name in models}
     retrieval_history = {name: [] for name in models}
     for model in models.values():
@@ -376,12 +404,7 @@ def append_history(
 
 def plot_loss_curves(
     history: dict[str, dict[str, list[float]]],
-    output_dir: Path,
-    show_plots: bool,
-    save_plots: bool,
 ):
-    import matplotlib.pyplot as plt
-
     epochs = range(1, len(next(iter(history.values()))["train_loss"]) + 1)
 
     fig, axes = plt.subplots(2, 4, figsize=(18, 8))
@@ -405,15 +428,9 @@ def plot_loss_curves(
         ax.grid(alpha=0.25)
         ax.legend()
 
-    fig.suptitle(f"Omniglot twin encoder metrics after epoch {len(next(iter(history.values()))['train_loss'])}")
+    completed_epochs = len(next(iter(history.values()))["train_loss"])
+    fig.suptitle(f"Omniglot twin encoder metrics after epoch {completed_epochs}")
     fig.tight_layout()
-    if save_plots:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_dir / "training_metrics.png", dpi=160)
-    if show_plots:
-        plt.show()
-    else:
-        plt.close(fig)
 
 
 @torch.no_grad()
@@ -432,7 +449,11 @@ def collect_diagnostic_batch(
     )
     indices = next(iter(sampler))
     images, labels = zip(*(dataset[index] for index in indices))
-    return torch.stack(list(images)), torch.tensor(labels, dtype=torch.long), torch.tensor(indices, dtype=torch.long)
+    return (
+        torch.stack(list(images)),
+        torch.tensor(labels, dtype=torch.long),
+        torch.tensor(indices, dtype=torch.long),
+    )
 
 
 @torch.no_grad()
@@ -442,18 +463,13 @@ def plot_cross_split_nearest_neighbor_diagnostics(
     train_dataset: datasets.Omniglot,
     eval_dataset: datasets.Omniglot,
     device: torch.device,
-    output_dir: Path,
     train_classes: int,
     eval_classes: int,
     samples_per_class: int,
     query_count: int,
     neighbor_count: int,
     seed: int,
-    show_plots: bool,
-    save_plots: bool,
 ):
-    import matplotlib.pyplot as plt
-
     model.eval()
     eval_images, eval_labels, eval_indices = collect_diagnostic_batch(
         dataset=eval_dataset,
@@ -483,7 +499,9 @@ def plot_cross_split_nearest_neighbor_diagnostics(
     gallery_embeddings = model.embed(gallery_images.to(device)).cpu()
     similarities = query_embeddings @ gallery_embeddings.T
 
-    same_eval_example = gallery_is_eval[None, :] & gallery_indices[None, :].eq(eval_indices[:, None])
+    same_eval_example = gallery_is_eval[None, :] & gallery_indices[None, :].eq(
+        eval_indices[:, None]
+    )
     similarities = similarities.masked_fill(same_eval_example, float("-inf"))
 
     rng = random.Random(seed)
@@ -520,103 +538,46 @@ def plot_cross_split_nearest_neighbor_diagnostics(
 
     fig.suptitle(f"{name} EMA eval queries vs mixed train+eval gallery", fontsize=13)
     fig.tight_layout()
-    if save_plots:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_dir / f"{name}_cross_split_neighbors.png", dpi=170)
-    if show_plots:
-        plt.show()
-    else:
-        plt.close(fig)
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description="Omniglot twin-network glyph embedding experiment")
+def main():
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    random.seed(SEED)
 
-    data_group = parser.add_argument_group("Data")
-    data_group.add_argument("--data_dir", type=Path, default=Path("data"))
-    data_group.add_argument("--image_size", type=int, default=64)
-    data_group.add_argument("--classes_per_batch", type=int, default=16)
-    data_group.add_argument("--samples_per_class", type=int, default=4)
-    data_group.add_argument("--train_batches_per_epoch", type=int, default=300)
-    data_group.add_argument("--eval_batches", type=int, default=80)
-    data_group.add_argument("--num_workers", type=int, default=2)
-
-    model_group = parser.add_argument_group("Model")
-    model_group.add_argument("--embedding_dim", type=int, default=64)
-
-    train_group = parser.add_argument_group("Training")
-    train_group.add_argument("--epochs", type=int, default=20)
-    train_group.add_argument("--lr", type=float, default=1e-4)
-    train_group.add_argument("--weight_decay", type=float, default=1e-4)
-    train_group.add_argument("--ema_decay", type=float, default=0.999)
-    train_group.add_argument("--positive_weight", type=float, default=0.5)
-    train_group.add_argument("--negative_weight", type=float, default=0.5)
-
-    diagnostics_group = parser.add_argument_group("Diagnostics")
-    diagnostics_group.add_argument("--output_dir", type=Path, default=Path(__file__).resolve().parent / "outputs")
-    diagnostics_group.add_argument("--diagnostic_eval_classes", type=int, default=8)
-    diagnostics_group.add_argument("--diagnostic_train_classes", type=int, default=32)
-    diagnostics_group.add_argument("--diagnostic_samples_per_class", type=int, default=4)
-    diagnostics_group.add_argument("--diagnostic_queries", type=int, default=6)
-    diagnostics_group.add_argument("--diagnostic_neighbors", type=int, default=10)
-    diagnostics_group.add_argument("--save_plots", action="store_true")
-    diagnostics_group.add_argument("--no_show_plots", action="store_false", dest="show_plots")
-    diagnostics_group.set_defaults(show_plots=True)
-
-    misc_group = parser.add_argument_group("Misc")
-    misc_group.add_argument("--seed", type=int, default=0)
-    misc_group.add_argument("--device", type=str, choices=["auto", "cpu", "cuda"], default="auto")
-
-    return parser.parse_args()
-
-
-def main(args):
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is false.")
-
-    try:
-        import matplotlib.pyplot  # noqa: F401
-        import tqdm  # noqa: F401
-    except ModuleNotFoundError as error:
-        raise ModuleNotFoundError(
-            "This experiment needs matplotlib and tqdm for plots/progress bars. "
-            "Install them, then rerun siamese/main.py."
-        ) from error
-
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    random.seed(args.seed)
-
-    batch_size = args.classes_per_batch * args.samples_per_class
-    print(f"Device: {device}")
-    print(f"Batch shape: {args.classes_per_batch} classes x {args.samples_per_class} samples = {batch_size}")
+    batch_size = CLASSES_PER_BATCH * SAMPLES_PER_CLASS
+    print(f"Device: {DEVICE}")
+    print(
+        f"Batch shape: {CLASSES_PER_BATCH} classes x {SAMPLES_PER_CLASS} samples "
+        f"= {batch_size}"
+    )
 
     train_loader, eval_loader, train_dataset, eval_dataset = get_omniglot_dataloaders(
-        data_dir=args.data_dir,
-        image_size=args.image_size,
-        classes_per_batch=args.classes_per_batch,
-        samples_per_class=args.samples_per_class,
-        train_batches_per_epoch=args.train_batches_per_epoch,
-        eval_batches=args.eval_batches,
-        num_workers=args.num_workers,
-        seed=args.seed,
+        data_dir=DATA_DIR,
+        image_size=IMAGE_SIZE,
+        classes_per_batch=CLASSES_PER_BATCH,
+        samples_per_class=SAMPLES_PER_CLASS,
+        train_batches_per_epoch=TRAIN_BATCHES_PER_EPOCH,
+        eval_batches=EVAL_BATCHES,
+        num_workers=NUM_WORKERS,
+        seed=SEED,
     )
 
     models = {
-        "deepcopy": TwinGlyphModel(args.embedding_dim, clone_second_tower=True).to(device),
-        "random": TwinGlyphModel(args.embedding_dim, clone_second_tower=False).to(device),
+        "deepcopy": TwinGlyphModel(EMBEDDING_DIM, clone_second_tower=True).to(DEVICE),
+        "random": TwinGlyphModel(EMBEDDING_DIM, clone_second_tower=False).to(DEVICE),
     }
-    ema_models = {name: copy.deepcopy(model).to(device) for name, model in models.items()}
+    ema_models = {name: copy.deepcopy(model).to(DEVICE) for name, model in models.items()}
     for ema_model in ema_models.values():
         set_requires_grad(ema_model, False)
         ema_model.eval()
 
     optimizers = {
-        name: torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        name: torch.optim.AdamW(
+            model.parameters(),
+            lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+        )
         for name, model in models.items()
     }
 
@@ -636,65 +597,57 @@ def main(args):
         for name in models
     }
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(1, NUM_EPOCHS + 1):
         train_stats = train_one_epoch(
             models=models,
             ema_models=ema_models,
             optimizers=optimizers,
             train_loader=train_loader,
-            device=device,
-            ema_decay=args.ema_decay,
-            positive_weight=args.positive_weight,
-            negative_weight=args.negative_weight,
+            device=DEVICE,
+            ema_decay=EMA_DECAY,
+            positive_weight=POSITIVE_WEIGHT,
+            negative_weight=NEGATIVE_WEIGHT,
             epoch=epoch,
         )
         eval_stats, retrieval_stats = evaluate(
             models=ema_models,
             eval_loader=eval_loader,
-            device=device,
-            positive_weight=args.positive_weight,
-            negative_weight=args.negative_weight,
+            device=DEVICE,
+            positive_weight=POSITIVE_WEIGHT,
+            negative_weight=NEGATIVE_WEIGHT,
             epoch=epoch,
         )
         append_history(history, train_stats, eval_stats, retrieval_stats)
-        plot_loss_curves(
-            history=history,
-            output_dir=args.output_dir,
-            show_plots=args.show_plots,
-            save_plots=args.save_plots,
-        )
-
         summary = []
         for name in models:
             summary.append(
                 f"{name}: train={train_stats[name].loss:.4f}, eval={eval_stats[name].loss:.4f}, "
-                f"eval pos cos={eval_stats[name].pos_sim:.3f}, eval neg cos={eval_stats[name].neg_sim:.3f}, "
-                f"top1={retrieval_stats[name].top1_same:.3f}, top3={retrieval_stats[name].top3_any_same:.3f}, "
-                f"mrr={retrieval_stats[name].mrr:.3f}, rank={retrieval_stats[name].mean_same_rank:.2f}"
+                f"eval pos cos={eval_stats[name].pos_sim:.3f}, "
+                f"eval neg cos={eval_stats[name].neg_sim:.3f}, "
+                f"top1={retrieval_stats[name].top1_same:.3f}, "
+                f"top3={retrieval_stats[name].top3_any_same:.3f}, "
+                f"mrr={retrieval_stats[name].mrr:.3f}, "
+                f"rank={retrieval_stats[name].mean_same_rank:.2f}"
             )
         print(f"Epoch {epoch}: " + " | ".join(summary))
 
+    plot_loss_curves(history)
     for name, model in ema_models.items():
         plot_cross_split_nearest_neighbor_diagnostics(
             model=model,
             name=name,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            device=device,
-            output_dir=args.output_dir,
-            train_classes=args.diagnostic_train_classes,
-            eval_classes=args.diagnostic_eval_classes,
-            samples_per_class=args.diagnostic_samples_per_class,
-            query_count=args.diagnostic_queries,
-            neighbor_count=args.diagnostic_neighbors,
-            seed=args.seed + 20_000,
-            show_plots=args.show_plots,
-            save_plots=args.save_plots,
+            device=DEVICE,
+            train_classes=DIAGNOSTIC_TRAIN_CLASSES,
+            eval_classes=DIAGNOSTIC_EVAL_CLASSES,
+            samples_per_class=DIAGNOSTIC_SAMPLES_PER_CLASS,
+            query_count=DIAGNOSTIC_QUERIES,
+            neighbor_count=DIAGNOSTIC_NEIGHBORS,
+            seed=SEED + 20_000,
         )
-
-    if args.save_plots:
-        print(f"Plots saved to {args.output_dir.resolve()}")
+    plt.show()
 
 
 if __name__ == "__main__":
-    main(get_args())
+    main()

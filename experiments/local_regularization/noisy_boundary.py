@@ -1,6 +1,3 @@
-from __future__ import annotations
-
-import argparse
 import copy
 from dataclasses import dataclass
 
@@ -13,6 +10,25 @@ try:
     from regularizer import local_weight_variance_loss
 except ImportError:
     from .regularizer import local_weight_variance_loss
+
+# Experiment configuration
+TRAIN_POINTS = 100
+EVAL_POINTS = 5_000
+GRID_SIZE = 160
+LABEL_FLIP_PROBABILITY = 0.20
+NUM_EPOCHS = 500
+STATE_SIZE = 128
+RESIDUAL_HIDDEN_SIZE = 128
+NUM_BLOCKS = 3
+RESIDUAL_SCALE = 1.0
+LEARNING_RATE = 1e-3
+REGULARIZATION_STRENGTH = 30.0
+OPTIMIZER_NAME = "adamw"  # "adamw" or "sgd"
+GRAD_CLIP = None
+SUMMARY_EVERY = 100
+SEED = 0
+DETERMINISTIC = False
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -38,39 +54,64 @@ class BoundaryStats:
     regularization_loss: float
 
 
-class BoundaryMLP(nn.Module):
-    def __init__(self, hidden_sizes: list[int]):
+class ResidualBoundaryBlock(nn.Module):
+    def __init__(self, state_size: int, residual_hidden_size: int, residual_scale: float):
         super().__init__()
-        layer_sizes = [2, *hidden_sizes, 2]
-        layers: list[nn.Module] = []
-        for in_features, out_features in zip(layer_sizes[:-2], layer_sizes[1:-1]):
-            layers.append(nn.Linear(in_features, out_features))
-            layers.append(nn.SiLU())
-        layers.append(nn.Linear(layer_sizes[-2], layer_sizes[-1]))
-        self.net = nn.Sequential(*layers)
+        self.residual_scale = residual_scale
+        self.net = nn.Sequential(
+            nn.Linear(state_size, residual_hidden_size),
+            nn.SiLU(),
+            nn.Linear(residual_hidden_size, state_size),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        return x + self.residual_scale * self.net(x)
 
 
-def parse_int_list(raw_values: str) -> list[int]:
-    if raw_values.strip() == "":
-        return []
-    return [int(value.strip()) for value in raw_values.split(",") if value.strip()]
+class ResidualBoundaryMLP(nn.Module):
+    def __init__(
+            self,
+            state_size: int,
+            residual_hidden_size: int,
+            num_blocks: int,
+            residual_scale: float,
+    ):
+        super().__init__()
+        if state_size < 1:
+            raise ValueError("state_size must be positive.")
+        if residual_hidden_size < 1:
+            raise ValueError("residual_hidden_size must be positive.")
+        if num_blocks < 0:
+            raise ValueError("num_blocks must be non-negative.")
+
+        self.input_projection = nn.Sequential(
+            nn.Linear(2, state_size),
+            nn.SiLU(),
+        )
+        self.blocks = nn.Sequential(
+            *[
+                ResidualBoundaryBlock(
+                    state_size=state_size,
+                    residual_hidden_size=residual_hidden_size,
+                    residual_scale=residual_scale,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        self.classifier = nn.Linear(state_size, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_projection(x)
+        x = self.blocks(x)
+        return self.classifier(x)
 
 
-def set_seed(seed: int, deterministic: bool):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    if deterministic:
+def set_seed():
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    if DETERMINISTIC:
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.benchmark = False
-
-
-def resolve_device(device_name: str) -> torch.device:
-    if device_name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_name)
 
 
 def clean_boundary_label(points: torch.Tensor) -> torch.Tensor:
@@ -78,11 +119,11 @@ def clean_boundary_label(points: torch.Tensor) -> torch.Tensor:
 
 
 def make_boundary_data(
-    train_points: int,
-    eval_points: int,
-    grid_size: int,
-    label_flip_probability: float,
-    seed: int,
+        train_points: int,
+        eval_points: int,
+        grid_size: int,
+        label_flip_probability: float,
+        seed: int,
 ) -> BoundaryData:
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -129,16 +170,12 @@ def move_data_to_device(data: BoundaryData, device: torch.device) -> BoundaryDat
     )
 
 
-def make_optimizer(
-    model: nn.Module,
-    lr: float,
-    optimizer_name: str,
-) -> torch.optim.Optimizer:
-    if optimizer_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
-    if optimizer_name == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=lr)
-    raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+def make_optimizer(model: nn.Module) -> torch.optim.Optimizer:
+    if OPTIMIZER_NAME == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.0)
+    if OPTIMIZER_NAME == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    raise ValueError(f"Unsupported optimizer: {OPTIMIZER_NAME}")
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -150,11 +187,11 @@ def accuracy_from_logits(logits: torch.Tensor, target: torch.Tensor) -> float:
 
 
 def train_one_epoch(
-    models: dict[str, nn.Module],
-    optimizers: dict[str, torch.optim.Optimizer],
-    data: BoundaryData,
-    regularization_strength: float,
-    grad_clip: float | None,
+        models: dict[str, nn.Module],
+        optimizers: dict[str, torch.optim.Optimizer],
+        data: BoundaryData,
+        regularization_strength: float,
+        grad_clip: float | None,
 ):
     for model in models.values():
         model.train()
@@ -207,8 +244,8 @@ def make_history(model_names: list[str]) -> dict[str, dict[str, list[float]]]:
 
 
 def append_history(
-    history: dict[str, dict[str, list[float]]],
-    stats: dict[str, BoundaryStats],
+        history: dict[str, dict[str, list[float]]],
+        stats: dict[str, BoundaryStats],
 ):
     for name in history:
         history[name]["observed_train_loss"].append(stats[name].observed_train_loss)
@@ -219,9 +256,9 @@ def append_history(
 
 
 def brief_epoch_summary(
-    epoch: int,
-    total_epochs: int,
-    stats: dict[str, BoundaryStats],
+        epoch: int,
+        total_epochs: int,
+        stats: dict[str, BoundaryStats],
 ) -> str:
     parts = [
         (
@@ -245,11 +282,11 @@ def show_plots():
 
 @torch.no_grad()
 def plot_results(
-    models: dict[str, nn.Module],
-    plot_data: BoundaryData,
-    device_data: BoundaryData,
-    history: dict[str, dict[str, list[float]]],
-    title: str,
+        models: dict[str, nn.Module],
+        plot_data: BoundaryData,
+        device_data: BoundaryData,
+        history: dict[str, dict[str, list[float]]],
+        title: str,
 ):
     import matplotlib.pyplot as plt
 
@@ -332,75 +369,55 @@ def plot_results(
     fig.tight_layout()
 
 
-def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Noisy-label 2D boundary test for local weight-variance regularization."
-    )
-    parser.add_argument("--train-points", type=int, default=128)
-    parser.add_argument("--eval-points", type=int, default=5_000)
-    parser.add_argument("--grid-size", type=int, default=160)
-    parser.add_argument("--label-flip-probability", type=float, default=0.20)
-    parser.add_argument("--num-epochs", type=int, default=500)
-    parser.add_argument("--hidden-sizes", type=str, default="64,64,64")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--regularization-strength", type=float, default=30.0)
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
-    parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--summary-every", "--log-every", dest="summary_every", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--deterministic", action="store_true")
-    return parser.parse_args()
-
-
-def main(args: argparse.Namespace):
-    set_seed(args.seed, args.deterministic)
-    device = resolve_device(args.device)
-
+def main():
+    set_seed()
     plot_data = make_boundary_data(
-        train_points=args.train_points,
-        eval_points=args.eval_points,
-        grid_size=args.grid_size,
-        label_flip_probability=args.label_flip_probability,
-        seed=args.seed,
+        train_points=TRAIN_POINTS,
+        eval_points=EVAL_POINTS,
+        grid_size=GRID_SIZE,
+        label_flip_probability=LABEL_FLIP_PROBABILITY,
+        seed=SEED,
     )
-    device_data = move_data_to_device(plot_data, device)
+    device_data = move_data_to_device(plot_data, DEVICE)
 
-    hidden_sizes = parse_int_list(args.hidden_sizes)
-    baseline = BoundaryMLP(hidden_sizes).to(device)
-    regularized = copy.deepcopy(baseline).to(device)
+    baseline = ResidualBoundaryMLP(
+        state_size=STATE_SIZE,
+        residual_hidden_size=RESIDUAL_HIDDEN_SIZE,
+        num_blocks=NUM_BLOCKS,
+        residual_scale=RESIDUAL_SCALE,
+    ).to(DEVICE)
+    regularized = copy.deepcopy(baseline).to(DEVICE)
     models = {
         "baseline": baseline,
         "local_variance": regularized,
     }
-    optimizers = {
-        name: make_optimizer(model, lr=args.lr, optimizer_name=args.optimizer)
-        for name, model in models.items()
-    }
+    optimizers = {name: make_optimizer(model) for name, model in models.items()}
 
     parameter_count = count_parameters(baseline)
     history = make_history(list(models))
     title = (
-        f"Noisy linear boundary | train={args.train_points} | "
-        f"flips={args.label_flip_probability:g} | params/train={parameter_count / args.train_points:.1f} | "
-        f"local variance lambda={args.regularization_strength:g}"
+        f"Noisy linear boundary | train={TRAIN_POINTS} | "
+        f"residual={NUM_BLOCKS}x({STATE_SIZE}->{RESIDUAL_HIDDEN_SIZE}->{STATE_SIZE}) | "
+        f"flips={LABEL_FLIP_PROBABILITY:g} | "
+        f"params/train={parameter_count / TRAIN_POINTS:.1f} | "
+        f"local variance lambda={REGULARIZATION_STRENGTH:g}"
     )
 
-    progress = tqdm(range(1, args.num_epochs + 1), desc="TRAIN", leave=False)
+    progress = tqdm(range(1, NUM_EPOCHS + 1), desc="TRAIN", leave=False)
     for epoch in progress:
         train_one_epoch(
             models=models,
             optimizers=optimizers,
             data=device_data,
-            regularization_strength=args.regularization_strength,
-            grad_clip=args.grad_clip,
+            regularization_strength=REGULARIZATION_STRENGTH,
+            grad_clip=GRAD_CLIP,
         )
         stats = evaluate(models, device_data)
         append_history(history, stats)
 
         should_summarize = (
-            args.summary_every > 0
-            and (epoch == 1 or epoch % args.summary_every == 0 or epoch == args.num_epochs)
+                SUMMARY_EVERY > 0
+                and (epoch == 1 or epoch % SUMMARY_EVERY == 0 or epoch == NUM_EPOCHS)
         )
         if should_summarize:
             progress.set_postfix(
@@ -408,11 +425,11 @@ def main(args: argparse.Namespace):
                 local_clean=f"{stats['local_variance'].clean_eval_accuracy:.3f}",
                 local_var=f"{stats['local_variance'].regularization_loss:.5f}",
             )
-            progress.write(brief_epoch_summary(epoch, args.num_epochs, stats))
+            progress.write(brief_epoch_summary(epoch, NUM_EPOCHS, stats))
 
     plot_results(models, plot_data, device_data, history, title)
     show_plots()
 
 
 if __name__ == "__main__":
-    main(get_args())
+    main()

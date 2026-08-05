@@ -1,15 +1,44 @@
-from __future__ import annotations
-
-import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from tqdm import tqdm
+
+# Experiment configuration
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+ARCHITECTURE = "mlp"  # "mlp" or "cnn"
+DATASET_NAME = "cifar10"  # "mnist", "fashion_mnist", or "cifar10"
+BATCH_SIZE = 256
+NUM_EPOCHS = 30
+MODEL_DIM = 64
+DEPTH = 6
+BASE_EXPANSION = 4
+MATCHED_EXPANSION = None  # Defaults to twice BASE_EXPANSION
+CONDITIONING_INIT_STD = 1e-2
+RESIDUAL_INIT_STD = 1e-2
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+OPTIMIZER_NAME = "adamw"  # "adamw" or "sgd"
+GRAD_CLIP = 1.0
+NUM_EXPERTS = 2
+MOE_LOAD_BALANCE_WEIGHT = 1e-2
+MOE_ROUTER_Z_LOSS_WEIGHT = 1e-3
+MOE_ROUTER_NOISE_STD = 0.0
+INCLUDE_ADALN_ABLATIONS = False
+INCLUDE_WIDE_DENSE = True
+INCLUDE_MOE = True
+TRAIN_LIMIT = None
+TEST_LIMIT = None
+NUM_WORKERS = 0
+NUM_EXAMPLES_TO_PLOT = 12
+SEED = 0
+DETERMINISTIC = False
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -608,20 +637,12 @@ def init_small_residual_projection(layer: nn.Module, std: float):
         nn.init.zeros_(layer.bias)
 
 
-def set_seed(seed: int, deterministic: bool):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    if deterministic:
+def set_seed():
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    if DETERMINISTIC:
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.benchmark = False
-
-
-def resolve_device(device_name: str) -> torch.device:
-    if device_name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is false.")
-    return torch.device(device_name)
 
 
 def canonical_dataset_name(name: str) -> str:
@@ -1333,145 +1354,142 @@ def show_plots():
         plt.show()
 
 
-def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Residual MLP/CNN comparison for self-conditioned AdaLN FFN blocks "
-            "versus dense and MoE FFNs with similar parameter count."
+def denormalize_images(images: torch.Tensor, dataset_name: str) -> torch.Tensor:
+    dataset_name = canonical_dataset_name(dataset_name)
+    if dataset_name in {"mnist", "fashion_mnist"}:
+        return images * 0.5 + 0.5
+
+    mean = images.new_tensor((0.4914, 0.4822, 0.4465))[None, :, None, None]
+    std = images.new_tensor((0.2470, 0.2435, 0.2616))[None, :, None, None]
+    return images * std + mean
+
+
+@torch.no_grad()
+def plot_predictions(
+        model: nn.Module,
+        dataloader: DataLoader,
+        dataset_name: str,
+        model_name: str,
+):
+    images, targets = next(iter(dataloader))
+    images = images[:NUM_EXAMPLES_TO_PLOT].to(DEVICE)
+    targets = targets[:NUM_EXAMPLES_TO_PLOT]
+    model.eval()
+    predictions = model(images).argmax(dim=-1).cpu()
+    display_images = denormalize_images(images, dataset_name).clamp(0.0, 1.0).cpu()
+
+    columns = 4
+    rows = (len(images) + columns - 1) // columns
+    _, axes = plt.subplots(rows, columns, figsize=(10, 2.5 * rows))
+    for index, axis in enumerate(axes.flat):
+        axis.axis("off")
+        if index >= len(images):
+            continue
+        image = display_images[index]
+        if image.size(0) == 1:
+            axis.imshow(image.squeeze(0), cmap="gray")
+        else:
+            axis.imshow(image.permute(1, 2, 0))
+        target = int(targets[index])
+        prediction = int(predictions[index])
+        axis.set_title(
+            f"true {target} | pred {prediction}",
+            color="green" if target == prediction else "red",
         )
-    )
-    parser.add_argument("--architecture", choices=["mlp", "cnn"], default="mlp")
-    parser.add_argument(
-        "--dataset",
-        choices=["mnist", "fashion_mnist", "fashion-mnist", "cifar10", "cifar-10"],
-        default="cifar10",
-    )
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--num-epochs", type=int, default=30)
-    parser.add_argument("--model-dim", type=int, default=64)
-    parser.add_argument("--depth", type=int, default=6)
-    parser.add_argument("--base-expansion", type=int, default=4)
-    parser.add_argument(
-        "--matched-expansion",
-        type=int,
-        default=None,
-        help="Dense comparison expansion. Defaults to 2 * --base-expansion.",
-    )
-    parser.add_argument("--conditioning-init-std", type=float, default=1e-2)
-    parser.add_argument("--residual-init-std", type=float, default=1e-2)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-experts", type=int, default=2)
-    parser.add_argument("--moe-load-balance-weight", type=float, default=1e-2)
-    parser.add_argument("--moe-router-z-loss-weight", type=float, default=1e-3)
-    parser.add_argument("--moe-router-noise-std", type=float, default=0.0)
-    parser.add_argument("--adaln-ablations", action="store_true")
-    parser.add_argument("--no-wide-dense", action="store_true")
-    parser.add_argument("--no-moe", action="store_true")
-    parser.add_argument("--train-limit", type=int, default=None)
-    parser.add_argument("--test-limit", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--no-download", action="store_true")
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--no-plots", action="store_true")
-    return parser.parse_args()
+    plt.suptitle(f"{model_name} evaluation predictions")
+    plt.tight_layout()
 
 
-def main(args: argparse.Namespace):
-    matched_expansion = args.matched_expansion
+def main():
+    matched_expansion = MATCHED_EXPANSION
     if matched_expansion is None:
-        matched_expansion = args.base_expansion * 2
+        matched_expansion = BASE_EXPANSION * 2
 
-    set_seed(args.seed, args.deterministic)
-    device = resolve_device(args.device)
+    set_seed()
     data = get_dataloaders(
-        dataset_name=args.dataset,
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
-        train_limit=args.train_limit,
-        test_limit=args.test_limit,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        download=not args.no_download,
+        dataset_name=DATASET_NAME,
+        data_dir=DATA_DIR,
+        batch_size=BATCH_SIZE,
+        train_limit=TRAIN_LIMIT,
+        test_limit=TEST_LIMIT,
+        num_workers=NUM_WORKERS,
+        seed=SEED,
+        download=True,
     )
 
     models = make_models(
-        architecture=args.architecture,
+        architecture=ARCHITECTURE,
         input_dim=data.input_dim,
         image_shape=data.image_shape,
         num_classes=data.num_classes,
-        model_dim=args.model_dim,
-        depth=args.depth,
-        base_expansion=args.base_expansion,
+        model_dim=MODEL_DIM,
+        depth=DEPTH,
+        base_expansion=BASE_EXPANSION,
         matched_expansion=matched_expansion,
-        conditioning_init_std=args.conditioning_init_std,
-        residual_init_std=args.residual_init_std,
-        include_wide_dense=not args.no_wide_dense,
-        include_moe=not args.no_moe,
-        include_adaln_ablations=args.adaln_ablations,
-        num_experts=args.num_experts,
-        router_noise_std=args.moe_router_noise_std,
+        conditioning_init_std=CONDITIONING_INIT_STD,
+        residual_init_std=RESIDUAL_INIT_STD,
+        include_wide_dense=INCLUDE_WIDE_DENSE,
+        include_moe=INCLUDE_MOE,
+        include_adaln_ablations=INCLUDE_ADALN_ABLATIONS,
+        num_experts=NUM_EXPERTS,
+        router_noise_std=MOE_ROUTER_NOISE_STD,
     )
-    models = {name: model.to(device) for name, model in models.items()}
+    models = {name: model.to(DEVICE) for name, model in models.items()}
     optimizers = {
         name: make_optimizer(
             model=model,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            optimizer_name=args.optimizer,
+            lr=LEARNING_RATE,
+            weight_decay=WEIGHT_DECAY,
+            optimizer_name=OPTIMIZER_NAME,
         )
         for name, model in models.items()
     }
 
-    print(f"Device: {device}")
+    print(f"Device: {DEVICE}")
     print(
         f"Dataset: {data.display_name} | input_dim={data.input_dim} | "
         f"image_shape={data.image_shape} | classes={data.num_classes}"
     )
     print(
-        f"Architecture: {args.architecture} | dim={args.model_dim}, "
-        f"depth={args.depth}, "
-        f"base_expansion={args.base_expansion}, "
+        f"Architecture: {ARCHITECTURE} | dim={MODEL_DIM}, "
+        f"depth={DEPTH}, "
+        f"base_expansion={BASE_EXPANSION}, "
         f"matched_expansion={matched_expansion}"
     )
-    if not args.no_moe:
+    if INCLUDE_MOE:
         print(
-            f"MoE: experts={args.num_experts}, "
-            f"load_balance_weight={args.moe_load_balance_weight:g}, "
-            f"router_z_loss_weight={args.moe_router_z_loss_weight:g}, "
-            f"router_noise_std={args.moe_router_noise_std:g}"
+            f"MoE: experts={NUM_EXPERTS}, "
+            f"load_balance_weight={MOE_LOAD_BALANCE_WEIGHT:g}, "
+            f"router_z_loss_weight={MOE_ROUTER_Z_LOSS_WEIGHT:g}, "
+            f"router_noise_std={MOE_ROUTER_NOISE_STD:g}"
         )
     print_parameter_table(models)
 
     history = make_history(list(models))
     final_test_stats = None
 
-    for epoch in range(1, args.num_epochs + 1):
+    for epoch in range(1, NUM_EPOCHS + 1):
         train_stats = train_one_epoch(
             models=models,
             optimizers=optimizers,
             dataloader=data.train_dataloader,
-            device=device,
+            device=DEVICE,
             epoch_index=epoch,
-            grad_clip=args.grad_clip,
-            moe_load_balance_weight=args.moe_load_balance_weight,
-            moe_router_z_loss_weight=args.moe_router_z_loss_weight,
+            grad_clip=GRAD_CLIP,
+            moe_load_balance_weight=MOE_LOAD_BALANCE_WEIGHT,
+            moe_router_z_loss_weight=MOE_ROUTER_Z_LOSS_WEIGHT,
         )
         test_stats = evaluate(
             models=models,
             dataloader=data.test_dataloader,
-            device=device,
+            device=DEVICE,
             epoch_index=epoch,
         )
         final_test_stats = test_stats
         append_history(history, train_stats, test_stats)
-        print(brief_epoch_summary(epoch, args.num_epochs, test_stats))
+        print(brief_epoch_summary(epoch, NUM_EPOCHS, test_stats))
 
+    best_name = None
     if final_test_stats is not None:
         best_name = max(final_test_stats, key=lambda name: final_test_stats[name].accuracy)
         best_stats = final_test_stats[best_name]
@@ -1480,16 +1498,21 @@ def main(args: argparse.Namespace):
             f"({best_stats.accuracy:.4f}, loss {best_stats.loss:.4f})"
         )
 
-    if not args.no_plots:
-        title = (
-            f"{data.display_name} residual {args.architecture.upper()} | "
-            f"dim={args.model_dim}, "
-            f"depth={args.depth}, base={args.base_expansion}x, "
-            f"matched={matched_expansion}x"
+    title = (
+        f"{data.display_name} residual {ARCHITECTURE.upper()} | "
+        f"dim={MODEL_DIM}, depth={DEPTH}, base={BASE_EXPANSION}x, "
+        f"matched={matched_expansion}x"
+    )
+    plot_history(history, title)
+    if best_name is not None:
+        plot_predictions(
+            models[best_name],
+            data.test_dataloader,
+            DATASET_NAME,
+            best_name,
         )
-        plot_history(history, title)
-        show_plots()
+    show_plots()
 
 
 if __name__ == "__main__":
-    main(get_args())
+    main()

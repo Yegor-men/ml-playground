@@ -1,6 +1,3 @@
-from __future__ import annotations
-
-import argparse
 import copy
 import math
 from dataclasses import dataclass
@@ -14,6 +11,23 @@ try:
     from regularizer import local_weight_variance_loss
 except ImportError:
     from .regularizer import local_weight_variance_loss
+
+# Experiment configuration
+TRAIN_POINTS = 32
+EVAL_POINTS = 256
+X_MIN = 0.0
+X_MAX = 2.0 * math.pi
+LABEL_NOISE = 0.15
+NUM_EPOCHS = 2_000
+HIDDEN_SIZES = [128, 128, 128]
+LEARNING_RATE = 1e-3
+REGULARIZATION_STRENGTH = 10.0
+OPTIMIZER_NAME = "adamw"  # "adamw" or "sgd"
+GRAD_CLIP = None
+SUMMARY_EVERY = 200
+SEED = 0
+DETERMINISTIC = False
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @dataclass
@@ -39,24 +53,12 @@ class SineNet(nn.Module):
         return self.net(x)
 
 
-def parse_int_list(raw_values: str) -> list[int]:
-    if raw_values.strip() == "":
-        return []
-    return [int(value.strip()) for value in raw_values.split(",") if value.strip()]
-
-
-def set_seed(seed: int, deterministic: bool):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    if deterministic:
+def set_seed():
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    if DETERMINISTIC:
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.benchmark = False
-
-
-def resolve_device(device_name: str) -> torch.device:
-    if device_name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_name)
 
 
 def make_sine_data(
@@ -73,7 +75,10 @@ def make_sine_data(
     train_x = x_min + (x_max - x_min) * torch.rand(train_points, 1, generator=generator)
     train_x = train_x.sort(dim=0).values
     train_y_clean = torch.sin(train_x)
-    train_y_observed = train_y_clean + label_noise * torch.randn(train_y_clean.shape, generator=generator)
+    train_y_observed = train_y_clean + label_noise * torch.randn(
+        train_y_clean.shape,
+        generator=generator,
+    )
 
     eval_x = torch.linspace(x_min, x_max, eval_points).unsqueeze(1)
     eval_y_clean = torch.sin(eval_x)
@@ -81,16 +86,12 @@ def make_sine_data(
     return (train_x, train_y_observed, train_y_clean), (eval_x, eval_y_clean)
 
 
-def make_optimizer(
-        model: nn.Module,
-        lr: float,
-        optimizer_name: str,
-) -> torch.optim.Optimizer:
-    if optimizer_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
-    if optimizer_name == "sgd":
-        return torch.optim.SGD(model.parameters(), lr=lr)
-    raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+def make_optimizer(model: nn.Module) -> torch.optim.Optimizer:
+    if OPTIMIZER_NAME == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.0)
+    if OPTIMIZER_NAME == "sgd":
+        return torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    raise ValueError(f"Unsupported optimizer: {OPTIMIZER_NAME}")
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -214,7 +215,13 @@ def plot_regression_results(
     fig, axes_grid = plt.subplots(2, 2, figsize=(13, 8))
     axes = axes_grid.flatten()
 
-    axes[0].plot(eval_x.squeeze(1), eval_y_clean.squeeze(1), color="black", linewidth=2.0, label="clean sine")
+    axes[0].plot(
+        eval_x.squeeze(1),
+        eval_y_clean.squeeze(1),
+        color="black",
+        linewidth=2.0,
+        label="clean sine",
+    )
     axes[0].scatter(
         train_x.squeeze(1),
         train_y_observed.squeeze(1),
@@ -268,79 +275,49 @@ def plot_regression_results(
     fig.tight_layout()
 
 
-def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Overparameterized sine-wave fit with and without local weight-variance regularization."
-    )
-    parser.add_argument("--train-points", type=int, default=32)
-    parser.add_argument("--eval-points", type=int, default=256)
-    parser.add_argument("--x-min", type=float, default=0.0)
-    parser.add_argument("--x-max", type=float, default=2.0 * math.pi)
-    parser.add_argument("--label-noise", type=float, default=0.15)
-    parser.add_argument("--batch-size", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--num-epochs", type=int, default=2000)
-    parser.add_argument("--hidden-sizes", type=str, default="128,128,128")
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--regularization-strength", type=float, default=10.0)
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
-    parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--plot-every", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--summary-every", "--log-every", dest="summary_every", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--deterministic", action="store_true")
-    return parser.parse_args()
-
-
-def main(args: argparse.Namespace):
-    set_seed(args.seed, args.deterministic)
-    device = resolve_device(args.device)
-
-    hidden_sizes = parse_int_list(args.hidden_sizes)
+def main():
+    set_seed()
     train_plot_tensors, eval_plot_tensors = make_sine_data(
-        train_points=args.train_points,
-        eval_points=args.eval_points,
-        x_min=args.x_min,
-        x_max=args.x_max,
-        label_noise=args.label_noise,
-        seed=args.seed,
+        train_points=TRAIN_POINTS,
+        eval_points=EVAL_POINTS,
+        x_min=X_MIN,
+        x_max=X_MAX,
+        label_noise=LABEL_NOISE,
+        seed=SEED,
     )
-    train_tensors = tuple(tensor.to(device) for tensor in train_plot_tensors)
-    eval_tensors = tuple(tensor.to(device) for tensor in eval_plot_tensors)
+    train_tensors = tuple(tensor.to(DEVICE) for tensor in train_plot_tensors)
+    eval_tensors = tuple(tensor.to(DEVICE) for tensor in eval_plot_tensors)
 
-    baseline = SineNet(hidden_sizes).to(device)
-    regularized = copy.deepcopy(baseline).to(device)
+    baseline = SineNet(HIDDEN_SIZES).to(DEVICE)
+    regularized = copy.deepcopy(baseline).to(DEVICE)
     models = {
         "baseline": baseline,
         "local_variance": regularized,
     }
-    optimizers = {
-        name: make_optimizer(model, lr=args.lr, optimizer_name=args.optimizer)
-        for name, model in models.items()
-    }
+    optimizers = {name: make_optimizer(model) for name, model in models.items()}
 
     parameter_count = count_parameters(baseline)
     history = make_history(list(models))
     plot_title = (
-        f"Sine fit | hidden={hidden_sizes} | train points={args.train_points} | "
-        f"noise={args.label_noise:g} | params/train={parameter_count / args.train_points:.1f} | "
-        f"local variance lambda={args.regularization_strength:g}"
+        f"Sine fit | hidden={HIDDEN_SIZES} | train points={TRAIN_POINTS} | "
+        f"noise={LABEL_NOISE:g} | params/train={parameter_count / TRAIN_POINTS:.1f} | "
+        f"local variance lambda={REGULARIZATION_STRENGTH:g}"
     )
 
-    progress = tqdm(range(1, args.num_epochs + 1), desc="TRAIN", leave=False)
+    progress = tqdm(range(1, NUM_EPOCHS + 1), desc="TRAIN", leave=False)
     for epoch in progress:
         train_one_epoch(
             models=models,
             optimizers=optimizers,
             train_tensors=train_tensors,
-            regularization_strength=args.regularization_strength,
-            grad_clip=args.grad_clip,
+            regularization_strength=REGULARIZATION_STRENGTH,
+            grad_clip=GRAD_CLIP,
         )
         stats = evaluate(models, train_tensors, eval_tensors)
         append_history(history, stats)
         should_summarize = (
-                args.summary_every > 0
-                and (epoch == 1 or epoch % args.summary_every == 0 or epoch == args.num_epochs)
+                SUMMARY_EVERY > 0
+                and (epoch == 1 or epoch % SUMMARY_EVERY == 0 or epoch == NUM_EPOCHS)
         )
         if should_summarize:
             progress.set_postfix(
@@ -350,7 +327,7 @@ def main(args: argparse.Namespace):
             )
 
         if should_summarize:
-            progress.write(brief_epoch_summary(epoch, args.num_epochs, stats))
+            progress.write(brief_epoch_summary(epoch, NUM_EPOCHS, stats))
 
     plot_regression_results(
         models=models,
@@ -364,4 +341,4 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    main(get_args())
+    main()
