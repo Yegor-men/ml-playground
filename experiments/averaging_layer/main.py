@@ -26,10 +26,10 @@ from diagnostics import (
 
 # Experiment configuration
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
-DATASET_NAME = "mnist"  # "mnist" or "fashion-mnist"
+DATASET_NAME = "fashion-mnist"  # "mnist" or "fashion-mnist"
 TRAIN_LIMIT = None  # None uses the entire training split.
 EVAL_LIMIT = None
-HIDDEN_SIZES = [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+HIDDEN_SIZES = [512, 128, 64, 512, 1024, 512, 1024, 512, 1024, 512]
 NUM_CLASSES = 10
 INIT_STDEV = 1e-3
 NUM_EPOCHS = 20
