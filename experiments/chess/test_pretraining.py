@@ -288,11 +288,15 @@ class PretrainingTests(unittest.TestCase):
     def test_model_samples_current_policy_with_value_head(self):
         player = play.Player(training.ChessPolicy(self.cfg).eval(), self.cfg, torch.device("cpu"))
         moves = [chess.Move.from_uci(uci) for uci in ("e2e4", "d2d4", "a2a4")]
+        logits = np.full(training.NUM_ACTIONS, -10.)
+        logits[[training.action_index(move) for move in moves]] = np.log([.64, .35, .01])
+        logits[training.action_index(chess.Move.from_uci("a1a8"))] = 10.
+        logits[0] = 9.  # Same-square pair, a1 to a1.
         evaluated = []
 
         def evaluate(board):
             evaluated.append(board.fen())
-            return moves, np.log([.64, .35, .01]), .99
+            return moves, logits, .99
 
         def choose(count, p):
             self.assertEqual(count, 3)
@@ -301,6 +305,18 @@ class PretrainingTests(unittest.TestCase):
 
         with patch.object(player, "evaluate_position", side_effect=evaluate), \
                 patch.object(player, "rng") as rng:
+            state = player.action("/state", {"sampling": {"temperature": 2., "min_p": 0.}})
+            self.assertEqual(len(state["raw_rows"]), 3 * play.RAW_LOGIT_ROWS)
+            self.assertEqual(state["raw_rows"][:3], [
+                dict(pair="a1 → a8", logit=10., legal=False, origin_type="white"),
+                dict(pair="a1 → a1", logit=9., legal=False, origin_type="white"),
+                dict(pair="e2 → e4", logit=np.log(.64), legal=True, origin_type="white"),
+            ])
+            for origin_type, first_square in (("black", "a7"), ("empty", "a3")):
+                rows = [row for row in state["raw_rows"] if row["origin_type"] == origin_type]
+                self.assertEqual(len(rows), play.RAW_LOGIT_ROWS)
+                self.assertEqual(rows[0]["pair"], f"{first_square} → a1")
+            self.assertEqual([row["move"] for row in state["rows"]], ["e4", "d4", "a4"])
             rng.choice.side_effect = choose
             player.model_move(play.sampling_options({}))
             rng.choice.assert_called_once()
@@ -318,6 +334,7 @@ class PretrainingTests(unittest.TestCase):
                 state = player.action("/position", {"fen": fen})
                 self.assertTrue(state["ended"])
                 self.assertEqual(state["white_score"], expected)
+                self.assertEqual(state["raw_rows"], [])
 
     def test_width_paths_and_legacy_pretrained_checkpoint(self):
         small = replace(self.cfg, pretrain_checkpoint_path="", dim=512)

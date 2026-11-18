@@ -42,6 +42,7 @@ PORT = 8000
 OPEN_BROWSER = True
 SEED = 42
 DEFAULT_SAMPLING = {"temperature": 1.0, "min_p": 0.1}
+RAW_LOGIT_ROWS = 100
 ENDGAMES = {
     "King + queen": "7k/8/5K2/8/8/8/8/1Q6 w - - 0 1",
     "King + rook": "7k/8/5K2/8/8/8/8/R7 w - - 0 1",
@@ -128,7 +129,7 @@ class Player:
 
     def evaluate(self, options=None):
         moves, logits, _ = self.current_analysis()
-        return moves, logits
+        return moves, logits[[action_index(move) for move in moves]]
 
     def current_analysis(self):
         key = (self.board.fen(), tuple(self.board.move_stack))
@@ -149,8 +150,7 @@ class Player:
             white_score = value.sigmoid().item()
         else:
             logits, white_score = self.network(*inputs), None
-        indices = [action_index(move) for move in moves]
-        return moves, logits[0, indices].cpu().numpy(), white_score
+        return moves, logits[0].cpu().numpy(), white_score
 
     def model_move(self, options):
         moves, values = self.evaluate()
@@ -164,14 +164,35 @@ class Player:
         self.board.push(move)
 
     def state(self, options):
-        moves, values, white_score = self.current_analysis()
-        probs = probabilities(values, options)
-        scores = policy_logits(values)
+        moves, logits, white_score = self.current_analysis()
+        raw_scores = policy_logits(logits)
+        legal_indices = [action_index(move) for move in moves]
+        scores = raw_scores[legal_indices]
+        probs = probabilities(scores, options)
         order = np.argsort(-scores, kind="stable")
         rows = []
         for i in order[:12]:
             move = moves[i]
             rows.append(dict(move=self.board.san(move), logit=float(scores[i]), p=float(probs[i])))
+        pieces = self.board.piece_map()
+        origin_types = {square: "white" if piece.color else "black" for square, piece in pieces.items()}
+        legal_actions = set(legal_indices)
+        # Keep the top rows per origin type so the browser can filter before taking its top 100.
+        remaining = dict.fromkeys(("white", "black", "empty"), RAW_LOGIT_ROWS)
+        raw_rows = []
+        for action in np.argsort(-raw_scores, kind="stable"):
+            origin, destination = divmod(int(action), 64)
+            origin_type = origin_types.get(origin, "empty")
+            if origin_type not in remaining:
+                continue
+            pair = f"{chess.square_name(origin)} → {chess.square_name(destination)}"
+            raw_rows.append(dict(pair=pair, logit=float(raw_scores[action]), legal=action in legal_actions,
+                                 origin_type=origin_type))
+            remaining[origin_type] -= 1
+            if remaining[origin_type] == 0:
+                del remaining[origin_type]
+                if not remaining:
+                    break
         ended, winner = game_result(self.board, self.cfg.rules)
         status = ("Draw" if winner is None else ("White" if winner else "Black") + " wins") if ended else (
                 ("White" if self.board.turn else "Black") + " to move")
@@ -184,12 +205,11 @@ class Player:
         game = chess.pgn.Game.from_board(self.board)
         if ended:
             game.headers["Result"] = "1/2-1/2" if winner is None else "1-0" if winner else "0-1"
-        return dict(fen=self.board.fen(), pieces={chess.square_name(s): p.symbol()
-                                                  for s, p in self.board.piece_map().items()},
-                    moves=[] if ended else [m.uci() for m in legal_moves(self.board, self.cfg.rules)],
+        return dict(fen=self.board.fen(), pieces={chess.square_name(s): p.symbol() for s, p in pieces.items()},
+                    moves=[move.uci() for move in moves],
                     last=self.board.peek().uci() if self.board.move_stack else "",
                     status=status, ended=ended, turn=self.board.turn, human=self.human,
-                    rows=rows, last_model=self.last_model, pgn=str(game),
+                    rows=rows, raw_rows=raw_rows, last_model=self.last_model, pgn=str(game),
                     history=game.accept(chess.pgn.StringExporter(headers=False, comments=False, variations=False)),
                     plies=len(self.board.move_stack), rules=self.cfg.rules,
                     training=training_summary(self.network), white_score=white_score)
@@ -233,8 +253,8 @@ PAGE = r'''<!doctype html>
 <title>Chess policy · Play the checkpoint</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#121a21;color:#e7ede9;font:15px system-ui,sans-serif}
-main{max-width:1150px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{color:#a8b8bc;line-height:1.5}
-.layout{display:grid;grid-template-columns:minmax(280px,610px) minmax(270px,1fr);gap:28px;margin-top:24px}
+main{max-width:1250px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{color:#a8b8bc;line-height:1.5}
+.layout{display:grid;grid-template-columns:minmax(280px,610px) minmax(480px,1fr);gap:28px;margin-top:24px}
 #board{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));grid-template-rows:repeat(8,minmax(0,1fr));width:100%;aspect-ratio:1;touch-action:none;user-select:none}
 .square{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0;background:#e1dbc8;color:#283d36}
 .square.dark{background:#698b7c}.square img{position:absolute;inset:4%;width:92%;height:92%;object-fit:contain;pointer-events:none}.square.selected{box-shadow:inset 0 0 0 5px #e4b853}
@@ -245,12 +265,20 @@ main{max-width:1150px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{colo
 button,select,input[type=text]{background:#2a3c47;color:#eef4ef;border:1px solid #4c646b;padding:9px;border-radius:6px;font:inherit}
 button{cursor:pointer}button:disabled{opacity:.4;cursor:wait}.buttons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
 input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:5px;border-bottom:1px solid #35454e}th:first-child,td:first-child{text-align:left}
+.scoreColumns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.originFilters{display:flex;flex-wrap:wrap;gap:4px 10px;margin:6px 0}
+.originFilters label{display:flex;align-items:center;gap:3px;margin:0}
+.rawScores{max-height:380px;overflow:auto}
+.rawScores th{position:sticky;top:0;background:#1c2831}
+.rawScores td:first-child{white-space:nowrap}
+.legalPair{color:#8bd4b1}
 #evalBar{height:12px;background:#151b20;border:1px solid #667781;border-radius:6px;overflow:hidden;margin-top:8px}
 #evalFill{height:100%;background:#f0eee5}
 #evalText{margin:4px 0 0}
 #status{font-size:20px;margin:14px 0}#error{color:#ffb5a6;min-height:24px}.small{font-size:12px;color:#a8b8bc}
 #history{background:#1c2831;padding:12px;border-radius:8px;min-height:3em;max-height:160px;overflow:auto;white-space:pre-wrap;font:inherit;line-height:1.6}
-@media(max-width:760px){main{padding:16px}.layout{grid-template-columns:1fr}}
+@media(max-width:900px){main{padding:16px}.layout{grid-template-columns:1fr}}
+@media(max-width:540px){.scoreColumns{grid-template-columns:1fr}}
 </style>
 <main><h1>Chess policy <span class="small">/ play the checkpoint</span></h1>
 <p id="training" class="small"></p>
@@ -268,15 +296,45 @@ input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-varia
 <p class="small">The model samples from legal moves on the current board. Min-p keeps moves at least this fraction as likely as the favourite.</p>
 <label><input id="auto" type="checkbox" checked> Model replies automatically</label>
 <div class="buttons"><button id="model">Make model move</button><button id="refresh">Refresh scores</button></div>
-<p id="modelInfo" class="small"></p><strong>Top legal moves</strong>
+<p id="modelInfo" class="small"></p>
+<div class="scoreColumns">
+<div><strong>Top legal moves</strong>
 <table><thead><tr><th>Move</th><th>Policy logit</th><th>P (filtered)</th></tr></thead><tbody id="scores"></tbody></table>
+</div>
+<div><strong id="rawHeading">Top raw logits</strong>
+<div id="originFilters" class="originFilters small" role="group" aria-label="Include moves from">
+<label><input type="checkbox" value="white" checked> White piece</label>
+<label><input type="checkbox" value="black" checked> Black piece</label>
+<label><input type="checkbox" value="empty" checked> Empty square</label>
+</div>
+<div class="rawScores" role="region" aria-labelledby="rawHeading" tabindex="0">
+<table><thead><tr><th>Squares</th><th>Logit</th><th>Status</th></tr></thead><tbody id="rawScores"></tbody></table>
+</div></div>
+</div>
 <p class="small" id="details"></p><p class="small">Logits are shown before temperature and min-p. Draws are claimed automatically when available. FEN loads start a new repetition history.</p></section></div></main><img id="ghost" alt="">
 <script>
 const icons=__ICONS__;
 const $=id=>document.getElementById(id);
 let state=null,flipped=false,selected=null,busy=false,drag=null;
 const fields=['temperature','min_p'];
+const originFilters=[...document.querySelectorAll('#originFilters input')];
+const rawLogitRows=__RAW_LOGIT_ROWS__;
 function sampling(){return Object.fromEntries(fields.map(id=>[id,$(id).valueAsNumber]));}
+function scoreRow(cells){
+ const row=document.createElement('tr');
+ for(const text of cells){const cell=document.createElement('td');cell.textContent=text;row.append(cell);}
+ return row;
+}
+function renderRawScores(){
+ if(!state)return;
+ const included=new Set(originFilters.filter(input=>input.checked).map(input=>input.value));
+ const rows=state.raw_rows.filter(row=>included.has(row.origin_type)).slice(0,rawLogitRows);
+ $('rawScores').replaceChildren(...rows.map(row=>{
+  const tr=scoreRow([row.pair,row.logit.toFixed(3),row.legal?'Legal':'Illegal']);
+  if(row.legal)tr.lastElementChild.className='legalPair';
+  return tr;
+ }));
+}
 function render(){
  if(!state)return;
  const board=$('board');board.replaceChildren();
@@ -304,8 +362,8 @@ function render(){
  $('details').textContent=`${state.rules} · ${state.plies} half-moves played · automatic queen promotion`;
  $('history').textContent=state.plies?state.history:'No moves yet';
  $('history').scrollTop=$('history').scrollHeight;
- $('scores').replaceChildren();
- for(const row of state.rows){const tr=document.createElement('tr');for(const text of [row.move,row.logit.toFixed(3),(100*row.p).toFixed(1)+'%']){const td=document.createElement('td');td.textContent=text;tr.append(td)}$('scores').append(tr)}
+ $('scores').replaceChildren(...state.rows.map(row=>scoreRow([row.move,row.logit.toFixed(3),(100*row.p).toFixed(1)+'%'])));
+ renderRawScores();
 }
 async function request(path,extra={}){
  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sampling:sampling(),...extra})});
@@ -344,6 +402,7 @@ $('model').onclick=()=>run('/model');$('refresh').onclick=()=>run('/state');
 $('load').onclick=()=>run('/position',{fen:$('fen').value},true);
 $('auto').onchange=()=>{if($('auto').checked&&state&&state.human!==null&&!state.ended&&state.turn!==state.human)run('/model')};
 for(const id of fields)$(id).onchange=()=>run('/state');
+for(const input of originFilters)input.onchange=renderRawScores;
 const endgames=__ENDGAMES__;
 for(const [name,fen] of Object.entries(endgames)){const option=document.createElement('option');option.value=fen;option.textContent=name;$('endgame').append(option)}
 $('endgame').onchange=()=>{const fen=$('endgame').value;$('endgame').value='';if(fen)run('/position',{fen})};
@@ -385,6 +444,7 @@ def serve(player):
              for s in "PNBRQKpnbrqk"}
     page = (PAGE.replace("__ICONS__", json.dumps(icons))
             .replace("__ENDGAMES__", json.dumps(ENDGAMES))
+            .replace("__RAW_LOGIT_ROWS__", str(RAW_LOGIT_ROWS))
             .replace("__SAMPLING__", json.dumps(sampling_options(DEFAULT_SAMPLING))).encode())
 
     class Handler(BaseHTTPRequestHandler):
