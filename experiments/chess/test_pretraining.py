@@ -258,8 +258,8 @@ class PretrainingTests(unittest.TestCase):
                 self.assertIn(move, allowed)
                 self.assertEqual(training.action_move(board, training.action_index(move)), move)
         values = np.array([3., 2., 1.])
-        np.testing.assert_array_equal(play.probabilities(values, dict(greedy=True)), [1., 0., 0.])
-        probs = play.probabilities(values, dict(greedy=False, temperature=1., min_p=.2))
+        np.testing.assert_array_equal(play.probabilities(values, dict(temperature=0.)), [1., 0., 0.])
+        probs = play.probabilities(values, dict(temperature=1., min_p=.2))
         self.assertEqual(probs[2], 0.)
         self.assertAlmostEqual(probs.sum(), 1.)
 
@@ -285,42 +285,31 @@ class PretrainingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 play.sampling_options(dict(min_p=invalid))
 
-    def test_search_expands_by_path_probability_and_chooses_by_outcome(self):
-        board = chess.Board()
-        board.push_uci("e2e4")
-        policy = {
-            (): (("e7e5", "c7c5", "e7e6"), (.5, .3, .2), .5),
-            ("e7e5",): (("g1f3", "f1c4", "d2d4", "b1c3"), (.4, .3, .2, .1), .8),
-            ("c7c5",): ((), (), .2),
-            ("e7e6",): ((), (), .6),
-            ("e7e5", "g1f3"): ((), (), .7),
-        }
-        visited = []
+    def test_model_samples_current_policy_with_value_head(self):
+        player = play.Player(training.ChessPolicy(self.cfg).eval(), self.cfg, torch.device("cpu"))
+        moves = [chess.Move.from_uci(uci) for uci in ("e2e4", "d2d4", "a2a4")]
+        evaluated = []
 
-        def evaluate(position):
-            path = tuple(move.uci() for move in position.move_stack[1:])
-            visited.append(path)
-            moves, probabilities, value = policy[path]
-            return [chess.Move.from_uci(move) for move in moves], np.log(probabilities), value
+        def evaluate(board):
+            evaluated.append(board.fen())
+            return moves, np.log([.64, .35, .01]), .99
 
-        move, score, positions = play.best_first_move(board, evaluate, play.sampling_options({}), budget=5)
-        self.assertEqual(visited, [(), ("e7e5",), ("c7c5",), ("e7e6",), ("e7e5", "g1f3")])
-        self.assertEqual(move.uci(), "c7c5")
-        self.assertAlmostEqual(score, .8)  # Black maximizes 1 - White's score.
-        self.assertEqual(positions, 5)
-        self.assertEqual(len(board.move_stack), 1)
+        def choose(count, p):
+            self.assertEqual(count, 3)
+            np.testing.assert_allclose(p, np.array([.64, .35, 0.]) / .99)
+            return 1
 
-    def test_analysis_budget_and_exact_terminal_scores(self):
+        with patch.object(player, "evaluate_position", side_effect=evaluate), \
+                patch.object(player, "rng") as rng:
+            rng.choice.side_effect = choose
+            player.model_move(play.sampling_options({}))
+            rng.choice.assert_called_once()
+        self.assertEqual(evaluated, [chess.STARTING_FEN])
+        self.assertEqual(player.board.move_stack, [moves[1]])
+
+    def test_exact_terminal_scores(self):
         network = training.ChessPolicy(self.cfg).eval()
         player = play.Player(network, self.cfg, torch.device("cpu"))
-        options = dict(search_positions=21, min_path_probability=0, min_p=0)
-        state = player.action("/analyze", {"sampling": options})
-        self.assertEqual(state["analyzed_positions"], 21)
-        self.assertEqual(play.sampling_options({"search_positions": 5000})["search_positions"], 5000)
-        with self.assertRaisesRegex(ValueError, "at least 21"):
-            player.action("/analyze", {"sampling": dict(search_positions=20)})
-        self.assertTrue(state["lines"])
-        self.assertEqual(player.board.fen(), chess.STARTING_FEN)
         with patch.object(network, "forward", side_effect=AssertionError("terminal network evaluation")):
             for fen, expected in (
                 ("7k/5KQ1/8/8/8/8/8/8 b - - 0 1", 1.0),
@@ -329,26 +318,6 @@ class PretrainingTests(unittest.TestCase):
                 state = player.action("/position", {"fen": fen})
                 self.assertTrue(state["ended"])
                 self.assertEqual(state["white_score"], expected)
-
-    def test_search_plays_mate_even_when_policy_prunes_it(self):
-        player = play.Player(training.ChessPolicy(self.cfg).eval(), self.cfg, torch.device("cpu"))
-        player.board = chess.Board("7k/5K2/6Q1/8/8/8/8/8 w - - 0 1")
-        evaluate = player.evaluate_search_position
-
-        def suppress_mates(board):
-            moves, logits, score = evaluate(board)
-            if not board.move_stack:
-                logits = np.zeros(len(moves))
-                for i, move in enumerate(moves):
-                    board.push(move)
-                    logits[i] = -1000. if board.is_checkmate() else 0.
-                    board.pop()
-            return moves, logits, score
-
-        options = play.sampling_options(dict(min_p=1, min_path_probability=1))
-        with patch.object(player, "evaluate_search_position", side_effect=suppress_mates):
-            player.model_move(options)
-        self.assertTrue(player.board.is_checkmate())
 
     def test_width_paths_and_legacy_pretrained_checkpoint(self):
         small = replace(self.cfg, pretrain_checkpoint_path="", dim=512)

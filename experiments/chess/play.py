@@ -8,12 +8,10 @@ For optional Stockfish matches, set MODE = "benchmark" and STOCKFISH_PATH.
 from __future__ import annotations
 
 import json
-import heapq
 import math
 import shutil
 import webbrowser
-from dataclasses import dataclass, field, replace
-from itertools import count
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -43,12 +41,7 @@ HOST = "127.0.0.1"
 PORT = 8000
 OPEN_BROWSER = True
 SEED = 42
-SEARCH_POSITIONS = 100  # Includes the root and evaluated terminal positions.
-SEARCH_MIN_PATH_PROBABILITY = .01  # The root candidates are exempt from this cutoff.
-ANALYSIS_LINES = 3
-DEFAULT_SAMPLING = {"temperature": 1.0, "min_p": 0.1,
-                    "search_positions": SEARCH_POSITIONS,
-                    "min_path_probability": SEARCH_MIN_PATH_PROBABILITY}
+DEFAULT_SAMPLING = {"temperature": 1.0, "min_p": 0.1}
 ENDGAMES = {
     "King + queen": "7k/8/5K2/8/8/8/8/1Q6 w - - 0 1",
     "King + rook": "7k/8/5K2/8/8/8/8/R7 w - - 0 1",
@@ -60,7 +53,7 @@ STOCKFISH_ELOS = (1320, 1600, 2000)  # Must fit the installed engine's UCI_Elo r
 GAMES_PER_ELO = 20  # Even: paired openings with colours swapped.
 STOCKFISH_SECONDS = 0.1  # Fixed engine time per move, not an official rating time control.
 MAX_PLIES = 400  # Capped games are unfinished, never counted as draws.
-BENCHMARK_SAMPLING = {**DEFAULT_SAMPLING, "greedy": True}
+BENCHMARK_SAMPLING = {**DEFAULT_SAMPLING}
 RESULTS_DIRECTORY = DIRECTORY.parents[1] / "data" / "chess" / "evaluation"
 OPENINGS = ((), ("e2e4", "e7e5"), ("d2d4", "d7d5"), ("c2c4", "e7e5"))
 
@@ -97,14 +90,7 @@ def sampling_options(raw):
         raise ValueError("Temperature must be between 0 and 100.")
     if not math.isfinite(min_p) or not 0 <= min_p <= 1:
         raise ValueError("Min-p must be between 0 and 1.")
-    positions = float(raw.get("search_positions", SEARCH_POSITIONS))
-    cutoff = float(raw.get("min_path_probability", SEARCH_MIN_PATH_PROBABILITY))
-    if not positions.is_integer() or positions < 2:
-        raise ValueError("Search positions must be a whole number of at least 2.")
-    if not 0 <= cutoff <= 1:
-        raise ValueError("Minimum path probability must be between 0 and 1.")
-    return dict(temperature=temperature, min_p=min_p,
-                search_positions=int(positions), min_path_probability=cutoff)
+    return dict(temperature=temperature, min_p=min_p)
 
 
 def policy_logits(values):
@@ -120,7 +106,7 @@ def probabilities(values, options):
     probs = np.zeros(len(scores), dtype=np.float64)
     if not len(scores):
         return probs
-    if options.get("greedy", False) or options["temperature"] == 0:
+    if options["temperature"] == 0:
         probs[int(np.argmax(scores))] = 1
         return probs
     logits = (scores - scores.max()) / options["temperature"]
@@ -128,88 +114,6 @@ def probabilities(values, options):
     # max(weights) == 1; probability ratios equal these unnormalized weights.
     weights[weights < options.get("min_p", DEFAULT_SAMPLING["min_p"])] = 0
     return weights / weights.sum()
-
-
-@dataclass
-class SearchNode:
-    static_value: float
-    our_turn: bool
-    children: list = field(default_factory=list)
-    value: float = field(init=False)
-
-    def __post_init__(self):
-        self.value = self.static_value
-
-    def back_up(self):
-        if self.our_turn:
-            self.value = max((child.value for _, child in self.children), default=self.static_value)
-        else:
-            # Retain the local estimate for replies outside the explored tree.
-            self.value = self.static_value + sum(
-                probability * (child.value - self.static_value) for probability, child in self.children)
-
-
-def best_first_move(board, evaluate, options, budget=SEARCH_POSITIONS,
-                    min_path_probability=SEARCH_MIN_PATH_PROBABILITY, lines=None):
-    """Expand the most probable line and choose by expected score for the root side."""
-    root_colour = board.turn
-    frontier = []
-    order = count()
-    positions = 0
-    root_choices = []
-
-    def expand(position, path, path_probability):
-        nonlocal positions
-        positions += 1
-        moves, logits, white_value = evaluate(position)
-        value = white_value if root_colour == chess.WHITE else 1 - white_value
-        node = SearchNode(value, position.turn == root_colour)
-        if not path:
-            minimum_budget = len(moves) + 1
-            if budget < minimum_budget:
-                raise ValueError(f"This position needs a budget of at least {minimum_budget} to check every legal first move.")
-            for move in moves:
-                heapq.heappush(frontier, (-2., next(order), (move,), node, 1.))
-            return node
-        # Path mass is conditional on choosing the first move.
-        probs = probabilities(logits, {**options, "min_p": 0., "greedy": False})
-        if moves:
-            threshold = probs.max() * options["min_p"]
-            for move, probability in zip(moves, probs):
-                mass = path_probability * probability
-                if probability > 0 and probability >= threshold and mass >= min_path_probability:
-                    heapq.heappush(frontier, (-mass, next(order), path + (move,), node, probability))
-        return node
-
-    root = expand(board, (), 1.)
-    if not frontier:
-        raise ValueError("The game has finished.")
-    # Nodes enter the backed-up tree only once evaluated. The heap stores moves,
-    # and replay from the root preserves the game's repetition history.
-    nodes = {(): root}
-    evaluated = []
-    while frontier and positions < budget:
-        negative_mass, _, path, parent, probability = heapq.heappop(frontier)
-        position = board.copy()
-        for move in path:
-            position.push(move)
-        mass = 1. if len(path) == 1 else -negative_mass
-        child = expand(position, path, mass)
-        nodes[path] = child
-        evaluated.append((mass, path, child))
-        parent.children.append((probability, child))
-        if len(path) == 1:
-            root_choices.append((path[0], child, position.is_checkmate()))
-        for length in range(len(path) - 1, -1, -1):
-            nodes[path[:length]].back_up()
-    if lines is not None:
-        leaves = [(mass, path, node) for mass, path, node in evaluated if not node.children]
-        leaves.sort(key=lambda leaf: leaf[0], reverse=True)
-        for mass, path, node in leaves[:ANALYSIS_LINES]:
-            lines.append(dict(moves=board.variation_san(path), probability=mass,
-                              white_score=node.value if root_colour == chess.WHITE else 1 - node.value))
-    move, child, _ = max(root_choices, key=lambda choice: (choice[2], choice[1].value))
-    return move, child.value, positions
 
 
 class Player:
@@ -229,12 +133,12 @@ class Player:
     def current_analysis(self):
         key = (self.board.fen(), tuple(self.board.move_stack))
         if key != self.cached_fen:
-            self.cached_analysis = self.evaluate_search_position(self.board)
+            self.cached_analysis = self.evaluate_position(self.board)
             self.cached_fen = key
         return self.cached_analysis
 
     @torch.inference_mode()
-    def evaluate_search_position(self, board):
+    def evaluate_position(self, board):
         ended, winner = game_result(board, self.cfg.rules)
         if ended:
             return [], np.array([]), .5 if winner is None else float(winner == chess.WHITE)
@@ -248,18 +152,8 @@ class Player:
         indices = [action_index(move) for move in moves]
         return moves, logits[0, indices].cpu().numpy(), white_score
 
-    def search(self, options, lines=None):
-        return best_first_move(self.board, self.evaluate_search_position, options,
-                               budget=options["search_positions"],
-                               min_path_probability=options["min_path_probability"], lines=lines)
-
     def model_move(self, options):
-        if self.network.has_value:
-            move, score, positions = self.search(options)
-            self.last_model = f"{self.board.san(move)} · expected score {score:.1%} · {positions} positions examined"
-            self.board.push(move)
-            return
-        moves, values = self.evaluate(options)
+        moves, values = self.evaluate()
         if not moves:
             raise ValueError("The game has finished.")
         probs = probabilities(values, options)
@@ -298,8 +192,7 @@ class Player:
                     rows=rows, last_model=self.last_model, pgn=str(game),
                     history=game.accept(chess.pgn.StringExporter(headers=False, comments=False, variations=False)),
                     plies=len(self.board.move_stack), rules=self.cfg.rules,
-                    training=training_summary(self.network), has_value=self.network.has_value,
-                    white_score=white_score)
+                    training=training_summary(self.network), white_score=white_score)
 
     def action(self, path, body):
         options = sampling_options(body.get("sampling", {}))
@@ -330,13 +223,6 @@ class Player:
             self.board.push(move)
         elif path == "/model":
             self.model_move(options)
-        elif path == "/analyze":
-            state = self.state(options)
-            if not self.network.has_value or state["ended"]:
-                return state
-            lines = []
-            move, _, positions = self.search(options, lines)
-            return dict(state, lines=lines, analyzed_positions=positions, best_move=self.board.san(move))
         elif path not in ("/state", "/control"):
             raise ValueError("Unknown action.")
         return self.state(options)
@@ -362,7 +248,6 @@ input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-varia
 #evalBar{height:12px;background:#151b20;border:1px solid #667781;border-radius:6px;overflow:hidden;margin-top:8px}
 #evalFill{height:100%;background:#f0eee5}
 #evalText{margin:4px 0 0}
-#lines{padding-left:22px;overflow-wrap:anywhere}#lines li{margin:6px 0}
 #status{font-size:20px;margin:14px 0}#error{color:#ffb5a6;min-height:24px}.small{font-size:12px;color:#a8b8bc}
 #history{background:#1c2831;padding:12px;border-radius:8px;min-height:3em;max-height:160px;overflow:auto;white-space:pre-wrap;font:inherit;line-height:1.6}
 @media(max-width:760px){main{padding:16px}.layout{grid-template-columns:1fr}}
@@ -377,17 +262,12 @@ input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-varia
 <label>Endgame examples</label><select id="endgame"><option value="">Choose a position</option></select>
 <p class="small">Paste any valid FEN to configure pieces and the side to move. Loading a position resets move history.</p>
 </section>
-<section class="panel"><strong>Search and move settings</strong>
-<div id="searchSettings">
-<label for="search_positions">Maximum positions (including current board)</label><input id="search_positions" type="number" min="2" step="1">
-<label for="min_path_probability">Minimum line probability (0–1)</label><input id="min_path_probability" type="number" min="0" max="1" step="any">
-</div>
+<section class="panel"><strong>Move sampling</strong>
 <label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="100" step="any">
 <label for="min_p">Min-p (0–1)</label><input id="min_p" type="number" min="0" max="1" step="any">
-<p class="small">Search checks every legal first move. Temperature, min-p, and the line probability cutoff apply to continuations after that move.</p>
+<p class="small">The model samples from legal moves on the current board. Min-p keeps moves at least this fraction as likely as the favourite.</p>
 <label><input id="auto" type="checkbox" checked> Model replies automatically</label>
-<div class="buttons"><button id="model">Make model move</button><button id="analyze">Analyze position</button><button id="refresh">Refresh scores</button></div>
-<div id="linePanel" hidden><strong>Likely lines explored</strong><p id="searchSummary" class="small"></p><ol id="lines"></ol></div>
+<div class="buttons"><button id="model">Make model move</button><button id="refresh">Refresh scores</button></div>
 <p id="modelInfo" class="small"></p><strong>Top legal moves</strong>
 <table><thead><tr><th>Move</th><th>Policy logit</th><th>P (filtered)</th></tr></thead><tbody id="scores"></tbody></table>
 <p class="small" id="details"></p><p class="small">Logits are shown before temperature and min-p. Draws are claimed automatically when available. FEN loads start a new repetition history.</p></section></div></main><img id="ghost" alt="">
@@ -395,7 +275,7 @@ input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-varia
 const icons=__ICONS__;
 const $=id=>document.getElementById(id);
 let state=null,flipped=false,selected=null,busy=false,drag=null;
-const fields=['temperature','min_p','min_path_probability','search_positions'];
+const fields=['temperature','min_p'];
 function sampling(){return Object.fromEntries(fields.map(id=>[id,$(id).valueAsNumber]));}
 function render(){
  if(!state)return;
@@ -414,8 +294,6 @@ function render(){
  $('training').textContent=state.training;
  $('side').value=state.human===null?'both':state.human?'white':'black';
  $('auto').disabled=state.human===null;
- $('searchSettings').hidden=!state.has_value;
- $('analyze').hidden=!state.has_value||state.ended;
  $('evalBar').hidden=state.white_score===null;
  if(state.white_score!==null){
   const percent=(100*state.white_score).toFixed(1);
@@ -423,16 +301,6 @@ function render(){
   $('evalBar').setAttribute('aria-valuenow',percent);
   $('evalText').textContent=`${state.ended?'Final White score':'White expected score'} ${percent}%`;
  }else $('evalText').textContent='';
- $('linePanel').hidden=!state.lines;
- if(state.lines){
-  $('searchSummary').textContent=`Search choice ${state.best_move} · ${state.analyzed_positions} positions examined`;
-  $('lines').replaceChildren();
-  for(const line of state.lines){
-   const item=document.createElement('li');
-   item.textContent=`${line.moves} · ${(100*line.probability).toFixed(2)}% continuation probability · ${(100*line.white_score).toFixed(1)}% White score`;
-   $('lines').append(item);
-  }
- }
  $('details').textContent=`${state.rules} · ${state.plies} half-moves played · automatic queen promotion`;
  $('history').textContent=state.plies?state.history:'No moves yet';
  $('history').scrollTop=$('history').scrollHeight;
@@ -472,7 +340,7 @@ window.addEventListener('pointercancel',()=>{drag=null;$('ghost').style.display=
 $('new').onclick=()=>{flipped=$('side').value==='black';run('/new',{side:$('side').value},true)};
 $('side').onchange=()=>run('/control',{side:$('side').value},true);
 $('undo').onclick=()=>run('/undo');$('flip').onclick=()=>{flipped=!flipped;render()};
-$('model').onclick=()=>run('/model');$('analyze').onclick=()=>run('/analyze');$('refresh').onclick=()=>run('/state');
+$('model').onclick=()=>run('/model');$('refresh').onclick=()=>run('/state');
 $('load').onclick=()=>run('/position',{fen:$('fen').value},true);
 $('auto').onchange=()=>{if($('auto').checked&&state&&state.human!==null&&!state.ended&&state.turn!==state.human)run('/model')};
 for(const id of fields)$(id).onchange=()=>run('/state');
@@ -575,9 +443,7 @@ def benchmark(player):
         raise ValueError("Use a positive even GAMES_PER_ELO for colour-swapped pairs.")
     if not Path(STOCKFISH_PATH).is_file():
         raise FileNotFoundError("Install Stockfish separately and set STOCKFISH_PATH.")
-    options = sampling_options(DEFAULT_SAMPLING)
-    if not player.network.has_value:
-        options["greedy"] = BENCHMARK_SAMPLING["greedy"]
+    options = sampling_options(BENCHMARK_SAMPLING)
     summaries = []
     RESULTS_DIRECTORY.mkdir(parents=True, exist_ok=True)
     from datetime import datetime

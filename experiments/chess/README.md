@@ -154,20 +154,12 @@ against a king. Loading a FEN resets move/repetition history. These let you test
 endgame behaviour without assuming the model has learned a reliable mating plan.
 
 The page also provides board flipping and PGN export, using local piece images
-and no web framework or CDN. The policy/value search first evaluates every legal
-root move, and immediate checkmate takes priority. Deeper lines are ordered by
-the product of their move probabilities conditional on the first move. The
-temperature, min-p, and path cutoff apply to those continuations. The default
-budget is 100 positions including the root, and the default cutoff is 1%.
-The budget must fit the root and every legal first move. These settings are
-editable in the browser. The budget and cutoff defaults are
-`SEARCH_POSITIONS` and `SEARCH_MIN_PATH_PROBABILITY` at the top of `play.py`.
-**Analyze position** lists the most probable evaluated leaf lines without changing
-the board. The value head scores nonterminal positions and chess rules give
-exact terminal scores. The model maximizes its backed-up expected score on its
-turns and averages replies by policy probability on the opponent's turns.
-Unexplored opponent probability mass retains the local estimate. Training
-uses the full legal-move softmax.
+and no web framework or CDN. The model samples a legal move from the current
+board's policy. Temperature defaults to 1.0, with 0 selecting the highest logit.
+Min-p defaults to 0.1, keeping moves at least one tenth as probable as the
+most probable move after temperature scaling. The browser lets you edit both
+settings. The value head feeds the evaluation bar. Training uses the full
+legal-move softmax.
 No repetition penalty has been added; existing standard draw claims still apply.
 Human games do not update the weights. All browser tabs share one local game.
 
@@ -185,7 +177,7 @@ self-play `ratings.py` and `test_ratings.py` have been removed. Do not commit
 
 Run `python -m unittest discover -s experiments/chess -p 'test_*.py'` in the
 project interpreter. Tests cover multi-file deduplication, stable game splits,
-cache reuse, compression, filters, shard roundtrips, value and search behaviour,
+cache reuse, compression, filters, shard roundtrips, value and policy sampling,
 intermediate saves, exact CPU dropout resuming, both-side control and endgames.
 `mode = "test"` runs a small model/masking/gradient check; `"inspect"` prints top
 moves for `inspect_fen`.
