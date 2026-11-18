@@ -1,0 +1,384 @@
+"""PGN caching, legal moves, offline gradients, resumable training and playback."""
+import bz2
+import gzip
+import math
+import random
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+import chess
+import chess.pgn
+import numpy as np
+import torch
+
+import main as training
+import play
+
+
+class PretrainingTests(unittest.TestCase):
+    def setUp(self):
+        torch.set_num_threads(2)
+        torch.manual_seed(42)
+        root = Path(__file__).resolve().parents[2] / "data"
+        self.temporary = tempfile.TemporaryDirectory(dir=root, prefix="chess_test_")
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name)
+        self.data_patch = patch.object(training, "DATA_DIRECTORY", self.path / "chess")
+        self.data_patch.start()
+        self.addCleanup(self.data_patch.stop)
+        self.cfg = training.Config(dim=32, heads=4, blocks=2, batch_size=32, dropout=0.,
+                                   device="cpu", resume=False, pretrain_epochs=1,
+                                   pretrain_max_games=30, pretrain_max_positions=1000,
+                                   pretrain_shard_positions=40, pretrain_validation_fraction=.3,
+                                   pretrain_pgn=str(self.path / "games.pgn"),
+                                   pretrain_checkpoint_path=str(self.path / "pretrained.pt"),
+                                   show_plots=False)
+        rng = random.Random(42)
+        games = []
+        for i in range(30):
+            board = chess.Board()
+            for _ in range(8):
+                board.push(rng.choice(list(board.legal_moves)))
+            game = chess.pgn.Game.from_board(board)
+            game.headers.update(WhiteElo="2000", BlackElo="1800", Result="1-0")
+            games.append(str(game))
+        self.pgn = "\n\n".join(games) + "\n\n"
+        Path(self.cfg.pretrain_pgn).write_text(self.pgn)
+
+    def test_targets_and_legal_masks_survive_shard_roundtrip(self):
+        dataset = training.prepare_pretraining(self.cfg)
+        self.assertEqual(dataset.manifest["counts"]["accepted"], 30)
+        self.assertGreater(len(dataset.manifest["shards"]), 1)
+        self.assertEqual(sum(dataset.manifest["positions"].values()), 240)
+        advantage = 2 * (1 - 1 / (1 + 10 ** (-.5)))
+        for split in ("train", "validation"):
+            count = 0
+            for pieces, metadata, actions, targets, legal, ratings, white_scores in dataset.batches(split, 17):
+                self.assertEqual(pieces.shape[1], 64)
+                np.testing.assert_allclose(targets, advantage * metadata[:, 13], rtol=1e-6)
+                np.testing.assert_array_equal(ratings, np.where(metadata[:, 13] == 1, 2000, 1800))
+                self.assertTrue(np.all(white_scores == 1))
+                for action, ids in zip(actions, legal):
+                    self.assertIn(action, ids)
+                count += len(actions)
+            self.assertEqual(count, dataset.manifest["positions"][split])
+        self.assertTrue(dataset.examples)
+
+    def test_multiple_files_dedup_and_stable_game_splits(self):
+        second = self.path / "other.pgn"
+        second.write_text(self.pgn)
+        sources = [(Path(self.cfg.pretrain_pgn), ""), (second, "")]
+        cfg = replace(self.cfg, pretrain_max_games=None)
+        with patch.object(training, "pgn_sources", return_value=sources):
+            dataset = training.prepare_pretraining(cfg)
+        self.assertEqual(dataset.manifest["counts"]["duplicates"], 30)
+        self.assertEqual(dataset.manifest["counts"]["accepted"], 30)
+        # Reversing archive order doesn't change split membership.
+        with patch.object(training, "pgn_sources", return_value=list(reversed(sources))):
+            reordered = training.prepare_pretraining(cfg)
+        for split in ("train", "validation"):
+            def signatures(data):
+                return sorted((p.tobytes(), m.tobytes(), int(a))
+                              for ps, ms, actions, _, _, _, _ in data.batches(split, 32)
+                              for p, m, a in zip(ps, ms, actions))
+            self.assertEqual(signatures(dataset), signatures(reordered))
+
+    def test_cache_reuse_and_filter_invalidation(self):
+        dataset = training.prepare_pretraining(self.cfg)
+        with patch.object(training, "game_samples", side_effect=AssertionError("reparsed cached PGNs")):
+            cached = training.prepare_pretraining(self.cfg)
+        self.assertEqual(dataset.directory, cached.directory)
+        changed = training.prepare_pretraining(replace(self.cfg, pretrain_min_rating=1700))
+        self.assertNotEqual(dataset.directory, changed.directory)
+
+    def test_filters_and_position_limit(self):
+        board = chess.Board("7k/P7/8/8/8/8/8/7K w - - 0 1")
+        board.push_uci("a7a8n")
+        underpromotion = chess.pgn.Game.from_board(board)
+        underpromotion.headers.update(WhiteElo="2000", BlackElo="1800", Result="1/2-1/2")
+        Path(self.cfg.pretrain_pgn).write_text(
+            self.pgn.replace('[WhiteElo "2000"]', '[WhiteElo "?"]')
+            + self.pgn.replace('1-0', '*') + str(underpromotion) + "\n\n" + self.pgn)
+        dataset = training.prepare_pretraining(self.cfg)
+        self.assertEqual(dataset.manifest["counts"]["skipped"], 61)
+        with self.assertRaisesRegex(ValueError, "nonempty"):
+            training.prepare_pretraining(replace(self.cfg, pretrain_max_positions=1))
+
+    def test_compressed_pgn_readers(self):
+        for suffix, compress in ((".gz", gzip.compress), (".bz2", bz2.compress)):
+            path = self.path / ("games.pgn" + suffix)
+            path.write_bytes(compress(self.pgn.encode()))
+            with training.open_pgn(path) as source:
+                self.assertEqual(source.read(), self.pgn)
+        try:
+            from compression import zstd
+        except ImportError:
+            return
+        path = self.path / "games.pgn.zst"
+        path.write_bytes(zstd.compress(self.pgn.encode()))
+        with training.open_pgn(path) as source:
+            self.assertEqual(source.read(), self.pgn)
+
+    def test_signed_gradient_and_bounded_negative_term(self):
+        nll = torch.tensor([1., 1., 20.], requires_grad=True)
+        targets = torch.tensor([1.5, -1.5, -1.5])
+        training.pretraining_loss(nll, targets, self.cfg).sum().backward()
+        torch.testing.assert_close(nll.grad, torch.tensor([2.5, -.5, 1.]))
+        imitation = replace(self.cfg, pretrain_advantage_weight=0.)
+        torch.testing.assert_close(training.pretraining_loss(nll, targets, imitation), nll)
+
+    def test_shuffled_data_cursor_resumes_without_replaying_positions(self):
+        dataset = training.prepare_pretraining(self.cfg)
+
+        def sequence(start, batch_size):
+            return [(p.tobytes(), int(a)) for ps, _, actions, _, _, _, _ in dataset.batches(
+                "train", batch_size, shuffle=True, seed=123, start=start) for p, a in zip(ps, actions)]
+
+        self.assertEqual(sequence(47, 17), sequence(0, 32)[47:])
+
+    def test_intermediate_save_and_exact_resume_with_dropout(self):
+        cfg = replace(self.cfg, dropout=.1, save_every_positions=64, preview_positions=16)
+        save = training.save_checkpoint
+
+        def stop_after_save(*args):
+            save(*args)
+            raise KeyboardInterrupt
+
+        with patch.object(training, "CONFIG", cfg), patch.object(training, "save_checkpoint", side_effect=stop_after_save):
+            training.main()
+        partial = training.read_checkpoint(training.checkpoint_path(cfg), "cpu")
+        cursor = partial["training_progress"]["positions"]
+        self.assertGreaterEqual(cursor, 64)
+        self.assertLess(cursor, partial["pretraining"]["positions"]["train"])
+        self.assertEqual(partial["model_version"], training.MODEL_VERSION)
+        with patch.object(training, "CONFIG", replace(cfg, resume=True, pretrain_min_rating=1700)):
+            with self.assertRaisesRegex(ValueError, "same dataset"):
+                training.main()
+        with patch.object(training, "CONFIG", replace(cfg, resume=True)):
+            training.main()
+        resumed = training.read_checkpoint(training.checkpoint_path(cfg), "cpu")
+        self.assertIsNone(resumed["training_progress"])
+        self.assertEqual(resumed["pretraining"]["trained_positions"], 160)
+        self.assertEqual(len(resumed["pretraining"]["history"]), 1)
+        uninterrupted = replace(cfg, pretrain_checkpoint_path=str(self.path / "uninterrupted.pt"))
+        with patch.object(training, "CONFIG", uninterrupted):
+            training.main()
+        reference = training.read_checkpoint(training.checkpoint_path(uninterrupted), "cpu")
+        for key in resumed["model"]:
+            torch.testing.assert_close(resumed["model"][key], reference["model"][key], rtol=0, atol=0)
+            torch.testing.assert_close(resumed["ema_model"][key], reference["ema_model"][key], rtol=0, atol=0)
+
+    def test_both_side_control_single_ply_undo_and_endgame_positions(self):
+        network = training.ChessPolicy(self.cfg).eval()
+        player = play.Player(network, self.cfg, torch.device("cpu"))
+        player.action("/move", dict(move="e2e4"))
+        player.action("/move", dict(move="e7e5"))
+        state = player.action("/undo", {})
+        self.assertEqual(state["plies"], 1)
+        self.assertEqual(player.board.turn, chess.BLACK)
+        player.action("/control", dict(side="white"))
+        with self.assertRaisesRegex(ValueError, "model's turn"):
+            player.action("/move", dict(move="c7c5"))
+        player.action("/control", dict(side="both"))
+        player.action("/move", dict(move="c7c5"))
+        for fen in play.ENDGAMES.values():
+            state = player.action("/position", dict(fen=fen))
+            self.assertFalse(state["ended"])
+            self.assertEqual(state["plies"], 0)
+            self.assertTrue(state["moves"])
+        fen = "7k/5K2/6Q1/8/8/8/8/8 w - - 0 1"
+        player.action("/position", dict(fen=fen))
+        state = player.action("/move", dict(move="g6g7"))
+        self.assertTrue(state["ended"])
+        self.assertTrue(player.board.is_checkmate())
+        player.action("/undo", {})
+        self.assertEqual(player.board.fen(), fen)
+        with self.assertRaises(ValueError):
+            player.action("/position", dict(fen="8/8/8/8/8/8/8/8 w - - 0 1"))
+
+    def test_training_resume_optimizer_and_play_checkpoint(self):
+        torch.manual_seed(self.cfg.seed)
+        initial = training.ChessPolicy(self.cfg)
+        with patch.object(training, "CONFIG", self.cfg):
+            training.main()
+        first = training.read_checkpoint(training.checkpoint_path(self.cfg), "cpu")
+        for head in ("start_cell.weight", "end_cell.weight"):
+            self.assertFalse(torch.equal(initial.state_dict()[head], first["model"][head]))
+        with patch.object(training, "CONFIG", replace(self.cfg, resume=True)):
+            training.main()
+        second = training.read_checkpoint(training.checkpoint_path(self.cfg), "cpu")
+        self.assertEqual([r["epoch"] for r in second["pretraining"]["history"]], [1, 2])
+        for key, state in first["optimizer"]["state"].items():
+            self.assertEqual(second["optimizer"]["state"][key]["step"], state["step"] * 2)
+        with patch.object(play, "CHECKPOINT_PATH", training.checkpoint_path(self.cfg)), patch.object(play, "DEVICE", "cpu"):
+            model, cfg, device = play.load_model()
+        moves, scores = play.Player(model, cfg, device).evaluate()
+        self.assertEqual(len(moves), 20)
+        self.assertTrue(all(math.isfinite(x) for x in scores))
+        self.assertIn("epoch 2", play.training_summary(model))
+        self.assertNotIn("pool", second)
+
+    def test_unlimited_training_interrupt_keeps_last_epoch(self):
+        epoch = training.pretraining_epoch
+        calls = 0
+
+        def interrupt_next_epoch(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise KeyboardInterrupt
+            return epoch(*args, **kwargs)
+
+        with patch.object(training, "CONFIG", replace(self.cfg, pretrain_epochs=None)), \
+                patch.object(training, "pretraining_epoch", side_effect=interrupt_next_epoch):
+            training.main()
+        saved = training.read_checkpoint(training.checkpoint_path(self.cfg), "cpu")
+        self.assertEqual(saved["pretraining"]["history"][-1]["epoch"], 1)
+
+    def test_projection_masks_and_special_moves(self):
+        model = training.ChessPolicy(self.cfg)
+        training.quick_test(model, torch.device("cpu"), self.cfg)
+        self.assertEqual(tuple(model.positions.shape), (64, self.cfg.dim))
+        _, value = model(*training.encode_batch([chess.Board()], torch.device("cpu")), with_value=True)
+        torch.nn.functional.binary_cross_entropy_with_logits(value, torch.tensor([.5])).backward()
+        for king in (model.white_king, model.black_king):
+            self.assertTrue(torch.isfinite(king.weight.grad).all())
+        for fen, ucis in (
+                ("1r2k3/P6p/8/8/8/8/8/4K3 w - - 0 1", ("a7a8q", "a7b8q")),
+                ("4k3/8/8/8/8/8/p6P/1R2K3 b - - 0 1", ("a2a1q", "a2b1q")),
+                ("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", ("e1g1", "e1c1")),
+                ("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", ("e5d6",))):
+            board = chess.Board(fen)
+            allowed = training.legal_moves(board, "standard")
+            for uci in ucis:
+                move = chess.Move.from_uci(uci)
+                self.assertIn(move, allowed)
+                self.assertEqual(training.action_move(board, training.action_index(move)), move)
+        values = np.array([3., 2., 1.])
+        np.testing.assert_array_equal(play.probabilities(values, dict(greedy=True)), [1., 0., 0.])
+        probs = play.probabilities(values, dict(greedy=False, temperature=1., min_p=.2))
+        self.assertEqual(probs[2], 0.)
+        self.assertAlmostEqual(probs.sum(), 1.)
+
+    def test_min_p_adapts_to_confidence_and_temperature(self):
+        options = play.sampling_options({})
+        self.assertEqual(options["min_p"], .1)
+        self.assertNotIn("top_k", options)
+        self.assertNotIn("top_p", options)
+        sharp = np.log([.90, .04, .03, .02, .01])
+        flat = np.log([.25, .24, .23, .18, .10])
+        np.testing.assert_array_equal(play.probabilities(sharp, options), [1, 0, 0, 0, 0])
+        np.testing.assert_allclose(play.probabilities(flat, options), np.exp(flat))
+        hotter = play.probabilities(sharp, {**options, "temperature": 2.})
+        self.assertEqual(np.count_nonzero(hotter), 5)
+        self.assertAlmostEqual(hotter.sum(), 1.)
+        np.testing.assert_allclose(play.probabilities(flat + 50, options), play.probabilities(flat, options))
+        np.testing.assert_allclose(play.probabilities(sharp, {**options, "min_p": 0.}), np.exp(sharp))
+        np.testing.assert_array_equal(play.probabilities([1., 1., 0.], {**options, "min_p": 1.}), [.5, .5, 0])
+        np.testing.assert_array_equal(play.probabilities(sharp, {**options, "temperature": 0.}), [1, 0, 0, 0, 0])
+        np.testing.assert_array_equal(play.probabilities([1000., 0., -1000.], options), [1, 0, 0])
+        self.assertEqual(len(play.probabilities([], options)), 0)
+        for invalid in (-.1, 1.1, float('nan')):
+            with self.assertRaises(ValueError):
+                play.sampling_options(dict(min_p=invalid))
+
+    def test_search_expands_by_path_probability_and_chooses_by_outcome(self):
+        board = chess.Board()
+        board.push_uci("e2e4")
+        policy = {
+            (): (("e7e5", "c7c5", "e7e6"), (.5, .3, .2), .5),
+            ("e7e5",): (("g1f3", "f1c4", "d2d4", "b1c3"), (.4, .3, .2, .1), .8),
+            ("c7c5",): ((), (), .2),
+            ("e7e6",): ((), (), .6),
+            ("e7e5", "g1f3"): ((), (), .7),
+        }
+        visited = []
+
+        def evaluate(position):
+            path = tuple(move.uci() for move in position.move_stack[1:])
+            visited.append(path)
+            moves, probabilities, value = policy[path]
+            return [chess.Move.from_uci(move) for move in moves], np.log(probabilities), value
+
+        move, score, positions = play.best_first_move(board, evaluate, play.sampling_options({}), budget=5)
+        self.assertEqual(visited, [(), ("e7e5",), ("c7c5",), ("e7e6",), ("e7e5", "g1f3")])
+        self.assertEqual(move.uci(), "c7c5")
+        self.assertAlmostEqual(score, .8)  # Black maximizes 1 - White's score.
+        self.assertEqual(positions, 5)
+        self.assertEqual(len(board.move_stack), 1)
+
+    def test_analysis_budget_and_exact_terminal_scores(self):
+        network = training.ChessPolicy(self.cfg).eval()
+        player = play.Player(network, self.cfg, torch.device("cpu"))
+        options = dict(search_positions=21, min_path_probability=0, min_p=0)
+        state = player.action("/analyze", {"sampling": options})
+        self.assertEqual(state["analyzed_positions"], 21)
+        self.assertEqual(play.sampling_options({"search_positions": 5000})["search_positions"], 5000)
+        with self.assertRaisesRegex(ValueError, "at least 21"):
+            player.action("/analyze", {"sampling": dict(search_positions=20)})
+        self.assertTrue(state["lines"])
+        self.assertEqual(player.board.fen(), chess.STARTING_FEN)
+        with patch.object(network, "forward", side_effect=AssertionError("terminal network evaluation")):
+            for fen, expected in (
+                ("7k/5KQ1/8/8/8/8/8/8 b - - 0 1", 1.0),
+                ("7k/5K2/6Q1/8/8/8/8/8 b - - 0 1", .5),
+            ):
+                state = player.action("/position", {"fen": fen})
+                self.assertTrue(state["ended"])
+                self.assertEqual(state["white_score"], expected)
+
+    def test_search_plays_mate_even_when_policy_prunes_it(self):
+        player = play.Player(training.ChessPolicy(self.cfg).eval(), self.cfg, torch.device("cpu"))
+        player.board = chess.Board("7k/5K2/6Q1/8/8/8/8/8 w - - 0 1")
+        evaluate = player.evaluate_search_position
+
+        def suppress_mates(board):
+            moves, logits, score = evaluate(board)
+            if not board.move_stack:
+                logits = np.zeros(len(moves))
+                for i, move in enumerate(moves):
+                    board.push(move)
+                    logits[i] = -1000. if board.is_checkmate() else 0.
+                    board.pop()
+            return moves, logits, score
+
+        options = play.sampling_options(dict(min_p=1, min_path_probability=1))
+        with patch.object(player, "evaluate_search_position", side_effect=suppress_mates):
+            player.model_move(options)
+        self.assertTrue(player.board.is_checkmate())
+
+    def test_width_paths_and_legacy_pretrained_checkpoint(self):
+        small = replace(self.cfg, pretrain_checkpoint_path="", dim=512)
+        large = replace(small, dim=1024)
+        self.assertNotEqual(training.checkpoint_path(small), training.checkpoint_path(large))
+        with patch.object(training, "CONFIG", self.cfg):
+            training.main()
+        path = training.checkpoint_path(self.cfg)
+        saved = training.read_checkpoint(path, "cpu")
+        saved.update(pool=None, history=[], iteration=0, training_version=3)
+        torch.save(saved, path)
+        model = training.ChessPolicy(self.cfg)
+        optimizer = torch.optim.AdamW(model.parameters())
+        training.load_checkpoint(model, optimizer, "cpu", self.cfg)
+        with self.assertRaisesRegex(ValueError, "wider model"):
+            training.load_checkpoint(training.ChessPolicy(replace(self.cfg, dim=64)), None,
+                                     "cpu", replace(self.cfg, dim=64))
+        legacy = training.ChessPolicy(self.cfg, legacy_blocks=1).eval()
+        saved.update(model_version=training.LEGACY_MODEL_VERSION, model=legacy.state_dict(),
+                     architecture=dict(dim=self.cfg.dim, heads=self.cfg.heads, blocks=1,
+                                       mlp_ratio=self.cfg.mlp_ratio, dropout=self.cfg.dropout))
+        torch.save(saved, path)
+        with self.assertRaisesRegex(ValueError, "legacy architecture"):
+            training.load_checkpoint(model, None, "cpu", self.cfg)
+        with patch.object(play, "CHECKPOINT_PATH", path), patch.object(play, "DEVICE", "cpu"):
+            loaded, cfg, device = play.load_model()
+        player = play.Player(loaded, cfg, device)
+        inputs = training.encode_batch([player.board], device)
+        torch.testing.assert_close(loaded(*inputs), legacy(*inputs))
+
+
+if __name__ == "__main__":
+    unittest.main()
