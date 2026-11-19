@@ -48,22 +48,22 @@ class Config:
     checkpoint_passes: bool = True  # Recompute block activations in backward to limit memory.
     rules: str = "standard"  # Legacy king-capture checkpoints remain playable.
     temperature: float = 1.0
-    batch_size: int = 128
+    batch_size: int = 512
     weight_decay: float = 0.01
     grad_clip: float = 1.0
 
-    # Empty means a width/depth/head-specific policy/value checkpoint under data/chess.
+    # The run name suffix separates this experiment from the original checkpoint.
     pretrain_checkpoint_path: str = ""
+    pretrain_run_name: str = "elo_weighted"
     resume: bool = True
     show_plots: bool = True
     save_every_positions: int = 100_000  # At the next completed optimizer batch; also saves at epoch end.
     preview_positions: int = 2_048  # Fixed held-out prefix for fast intermediate validation/plots.
     pretrain_epochs: int | None = None  # Until Ctrl+C, or N additional full passes.
-    # These three months contain ~404K games before filtering, ~60 MB compressed.
-    pretrain_months: tuple[str, ...] = ("2013-01", "2013-02", "2013-03")
+    pretrain_months: tuple[str, ...] = tuple(f"2013-{month:02d}" for month in range(1, 13))
     pretrain_pgn: str = ""  # Optional local PGN override, under data/.
     pretrain_url: str = ""  # Optional download URL for that override.
-    pretrain_max_games: int | None = 100_000  # Across all files; None uses all.
+    pretrain_max_games: int | None = None  # Across all files; None uses all.
     pretrain_max_positions: int | None = None  # Optional total dataset limit.
     pretrain_shard_positions: int = 50_000  # RAM bound, not a dataset limit.
     pretrain_min_rating: int = MIN_RATING
@@ -83,14 +83,23 @@ MODEL_VERSION = 10
 LEGACY_MODEL_VERSION = 6
 DATASET_VERSION = 3  # Store the final White score for position value training.
 META_SIZE = 14
+SIDE_TO_MOVE_INDEX = 13
 NUM_ACTIONS = 64 * 64
 ACTION_ENCODING = "from_square * 64 + to_square; automatic queen promotion"
 ARCHITECTURE_KEYS = ("dim", "heads", "blocks", "mlp_ratio", "dropout")
+MEAN_METRICS = ("loss", "nll", "accuracy", "value_bce")
+OUTCOME_METRICS = (("winner_match", "winner_positions"), ("loser_disagree", "loser_positions"))
+
+
+def base_checkpoint_path(cfg):
+    return DATA_DIRECTORY / f"chess_rope_value_d{cfg.dim}_b{cfg.blocks}_h{cfg.heads}.pt"
 
 
 def checkpoint_path(cfg):
-    return Path(cfg.pretrain_checkpoint_path) if cfg.pretrain_checkpoint_path else (
-            DATA_DIRECTORY / f"chess_rope_value_d{cfg.dim}_b{cfg.blocks}_h{cfg.heads}.pt")
+    if cfg.pretrain_checkpoint_path:
+        return Path(cfg.pretrain_checkpoint_path)
+    path = base_checkpoint_path(cfg)
+    return path.with_stem(f"{path.stem}_{cfg.pretrain_run_name}") if cfg.pretrain_run_name else path
 
 
 def action_index(move: chess.Move) -> int:
@@ -116,7 +125,7 @@ def encode_board(board: chess.Board) -> tuple[np.ndarray, np.ndarray]:
     if board.ep_square is not None:
         metadata[4 + chess.square_file(board.ep_square)] = 1
     metadata[12] = min(board.halfmove_clock, 100) / 100
-    metadata[13] = 1 if board.turn else -1
+    metadata[SIDE_TO_MOVE_INDEX] = 1 if board.turn else -1
     return pieces, metadata
 
 
@@ -301,21 +310,25 @@ class Step:
     white_score: float = .5
 
 
-def open_pgn(path):
+def open_pgn(path, raw=None):
     """Read compressed PGNs without expanding a monthly archive on disk."""
+    stream = raw if raw is not None else path
     if path.suffix == ".zst":
         try:
             from compression import zstd  # Python 3.14+
-            return zstd.open(path, "rt", encoding="utf-8")
+            return zstd.open(stream, "rt", encoding="utf-8")
         except ImportError:
             try:
                 import zstandard
             except ImportError as exc:
                 raise RuntimeError("For .zst PGNs use Python 3.14+, install zstandard, "
                                    "or decompress to .pgn and change pretrain_pgn.") from exc
-            return io.TextIOWrapper(zstandard.open(path, "rb"), encoding="utf-8")
-    opener = gzip.open if path.suffix == ".gz" else bz2.open if path.suffix == ".bz2" else open
-    return opener(path, "rt", encoding="utf-8")
+            return io.TextIOWrapper(zstandard.open(stream, "rb"), encoding="utf-8")
+    if path.suffix == ".gz":
+        return gzip.open(stream, "rt", encoding="utf-8")
+    if path.suffix == ".bz2":
+        return bz2.open(stream, "rt", encoding="utf-8")
+    return io.TextIOWrapper(raw, encoding="utf-8") if raw is not None else path.open("rt", encoding="utf-8")
 
 
 def download_pgn(path, url):
@@ -477,11 +490,31 @@ def prepare_pretraining(cfg):
         buffer.clear()
         held_out_flags.clear()
 
+    if cfg.pretrain_max_games is not None:
+        total, unit = cfg.pretrain_max_games, "game"
+    elif cfg.pretrain_max_positions is not None:
+        total, unit = cfg.pretrain_max_positions, "position"
+    else:
+        total, unit = sum(size for _, size, _ in signature["files"]), "B"
+
     stop = False
-    with tqdm(total=cfg.pretrain_max_games, desc="Cache rated games", unit="game") as progress:
-        for path, _ in sources:
-            with open_pgn(path) as source:
+    previous_bytes = 0
+    last_pending_byte = max(0, total - 1)
+    with tqdm(total=total, desc="Cache rated games", unit=unit, unit_scale=unit == "B") as progress:
+        for archive, ((path, _), (_, archive_size, _)) in enumerate(zip(sources, signature["files"]), 1):
+            with path.open("rb") as raw, open_pgn(path, raw) as source:
                 while not stop:
+                    progress.set_postfix_str(f"archive {archive}/{len(sources)}, "
+                                             f"{counts['scanned']:,} scanned, {counts['accepted']:,} kept",
+                                             refresh=False)
+                    if unit == "game":
+                        completed = counts["accepted"]
+                    elif unit == "position":
+                        completed = sum(positions.values())
+                    else:
+                        # Buffered decompression can read ahead. Finish the bar after the last shard is written.
+                        completed = min(previous_bytes + raw.tell(), last_pending_byte)
+                    progress.update(completed - progress.n)
                     if cfg.pretrain_max_games is not None and counts["accepted"] >= cfg.pretrain_max_games:
                         stop = True
                         break
@@ -511,12 +544,17 @@ def prepare_pretraining(cfg):
                         examples.append(example)
                     seen.add(digest)
                     counts["accepted"] += 1
-                    progress.update(1)
                     if len(buffer) >= cfg.pretrain_shard_positions:
                         flush()
             if stop:
                 break
-    flush()
+            previous_bytes += archive_size
+        flush()
+        progress.set_postfix_str(f"{counts['scanned']:,} scanned, {counts['accepted']:,} kept", refresh=False)
+        if unit == "B":
+            progress.update(total - progress.n)
+        else:
+            progress.total = progress.n
     if not positions["train"] or not positions["validation"]:
         raise ValueError("Need nonempty training and validation game splits; increase dataset limits.")
     manifest = dict(signature=signature, counts=counts, positions=positions, examples=examples, shards=shards)
@@ -535,12 +573,31 @@ def pretraining_loss(nll, advantages, cfg):
     return cfg.pretrain_imitation_weight * nll + cfg.pretrain_advantage_weight * surprise
 
 
+def pretraining_metrics(sums, positions):
+    metrics = {key: sums[key] / max(1, positions) for key in MEAN_METRICS}
+    for key, total in OUTCOME_METRICS:
+        metrics[key] = sums[key] / sums[total] if sums.get(total, 0) else None
+    return metrics
+
+
+def outcome_rates(metrics):
+    def percent(key):
+        rate = metrics[key]
+        return f"{rate:.1%}" if rate is not None else "n/a"
+
+    return f"winner match {percent('winner_match')}, loser disagreement {percent('loser_disagree')}"
+
+
 def pretraining_epoch(network, optimizer, dataset, device, cfg, state=None, on_batch=None, limit=None,
                       ema=None):
     training = optimizer is not None
     network.train(training)
     split = "train" if training else "validation"
-    state = state if state is not None else dict(positions=0, sums=dict(loss=0., nll=0., accuracy=0., value_bce=0.))
+    state = state if state is not None else dict(positions=0, sums=dict.fromkeys(MEAN_METRICS, 0.))
+    sums = state["sums"]
+    for keys in OUTCOME_METRICS:
+        for key in keys:
+            sums.setdefault(key, 0)
     total = dataset.manifest["positions"][split]
     if limit is not None:
         total = min(total, limit)
@@ -550,7 +607,7 @@ def pretraining_epoch(network, optimizer, dataset, device, cfg, state=None, on_b
         batches = dataset.batches(split, cfg.batch_size, shuffle=training,
                                   seed=state.get("seed", cfg.seed), start=start,
                                   limit=None if limit is None else total - start)
-        for pieces, metadata, actions, targets, legal, _, white_scores in batches:
+        for pieces, metadata, actions, targets, legal, ratings, white_scores in batches:
             p = torch.as_tensor(pieces, dtype=torch.long, device=device)
             m = torch.as_tensor(metadata, dtype=torch.float32, device=device)
             a = torch.as_tensor(actions.astype(np.int64), device=device)
@@ -562,8 +619,10 @@ def pretraining_epoch(network, optimizer, dataset, device, cfg, state=None, on_b
                 masks[j, ids.astype(np.int64)] = True
             _, log_probs, _ = masked_policy(logits, masks, cfg.temperature)
             nll = -log_probs.gather(1, a[:, None]).squeeze(1)
-            value_bce = F.binary_cross_entropy_with_logits(value_logits, scores)
-            loss = pretraining_loss(nll, advantages, cfg).mean() + cfg.value_loss_weight * value_bce
+            value_losses = F.binary_cross_entropy_with_logits(value_logits, scores, reduction="none")
+            weights = torch.as_tensor(ratings, dtype=torch.float32, device=device) / 100
+            position_losses = pretraining_loss(nll, advantages, cfg) + cfg.value_loss_weight * value_losses
+            loss = (weights * position_losses).sum() / weights.sum().clamp_min(1e-8)
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -573,33 +632,42 @@ def pretraining_epoch(network, optimizer, dataset, device, cfg, state=None, on_b
                     with torch.no_grad():
                         for average, current in zip(ema.parameters(), network.parameters()):
                             average.lerp_(current, 1 - cfg.ema_decay)
-            for key, value in (("loss", loss), ("nll", nll.mean()),
-                               ("value_bce", value_bce),
-                               ("accuracy", (log_probs.argmax(-1) == a).float().mean())):
-                state["sums"][key] += len(actions) * value.detach().item()
+            mover_scores = torch.where(m[:, SIDE_TO_MOVE_INDEX] > 0, scores, 1 - scores)
+            won, lost = mover_scores == 1, mover_scores == 0
+            matches = log_probs.argmax(-1) == a
+            totals = torch.stack((loss.detach() * len(actions), nll.detach().sum(), matches.sum(),
+                                  value_losses.detach().sum(), (matches & won).sum(), won.sum(),
+                                  (~matches & lost).sum(), lost.sum())).tolist()
+            for key, value in zip((*MEAN_METRICS, *OUTCOME_METRICS[0], *OUTCOME_METRICS[1]), totals):
+                sums[key] += value
             state["positions"] += len(actions)
             progress.update(len(actions))
             if on_batch is not None:
                 on_batch(state)
                 network.train(training)  # A preview temporarily puts the model into eval mode.
-    return {key: value / max(1, state["positions"]) for key, value in state["sums"].items()}
+    return pretraining_metrics(sums, state["positions"])
 
 
 def plot_history(history, cfg=None, positions=False):
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
     if positions:
-        figure, axes = plt.subplots(1, 2, figsize=(11, 4), num="Training progress", clear=True)
+        figure, axes = plt.subplots(2, 2, figsize=(11, 7), num="Training progress", clear=True)
     else:
-        figure, axes = plt.subplots(1, 2, figsize=(11, 4))
+        figure, axes = plt.subplots(2, 2, figsize=(11, 7))
     x = [r["positions"] for r in history] if positions else [r["epoch"] for r in history]
     xlabel = "Training positions" if positions else "Epoch"
-    for split in ("train", "validation"):
-        axes[0].plot(x, [r[split]["nll"] for r in history], label=split)
-        axes[1].plot(x, [r[split]["accuracy"] for r in history], label=split)
-    axes[0].set(title="Human move NLL", xlabel=xlabel)
-    axes[1].set(title="Human move top-1 accuracy", xlabel=xlabel)
-    for ax in axes:
-        ax.legend()
+    for ax, key, title in zip(axes.flat, ("nll", "value_bce", "winner_match", "loser_disagree"),
+                              ("Human move NLL", "Value BCE", "Winner move agreement", "Loser move disagreement")):
+        for split, label in (("train", "Train"), ("validation", "EMA validation")):
+            values = np.array([row[split].get(key) for row in history], dtype=float)
+            if np.isfinite(values).any():
+                ax.plot(x, values, marker=".", label=label)
+        ax.set(title=title, xlabel=xlabel)
+        if key in ("winner_match", "loser_disagree"):
+            ax.yaxis.set_major_formatter(PercentFormatter(1))
+        if ax.lines:
+            ax.legend()
         ax.grid(alpha=.25)
     figure.tight_layout()
     if positions:
@@ -654,7 +722,7 @@ def pretrain(network, device, cfg, optimizer, ema):
     try:
         for epoch in epochs:
             state = progress or dict(epoch=epoch, dataset=dataset.directory.name, seed=cfg.seed + epoch,
-                                     positions=0, sums=dict(loss=0., nll=0., accuracy=0., value_bce=0.))
+                                     positions=0, sums=dict.fromkeys(MEAN_METRICS, 0.))
             network.training_progress = state
             start_positions = state["positions"]
             base_positions = summary["trained_positions"]
@@ -671,8 +739,9 @@ def pretrain(network, device, cfg, optimizer, ema):
                 if summary["trained_positions"] < next_save:
                     return
                 count_positions = current["positions"] - report_positions
-                window = {key: (value - report_sums[key]) / count_positions
-                          for key, value in current["sums"].items()}
+                window_sums = {key: value - report_sums.get(key, 0)
+                               for key, value in current["sums"].items()}
+                window = pretraining_metrics(window_sums, count_positions)
                 # A fixed validation prefix keeps these updates fast; full validation stays at epoch end.
                 preview = pretraining_epoch(ema, None, dataset, device, cfg, limit=cfg.preview_positions)
                 previews.append(dict(positions=summary["trained_positions"], epoch=epoch,
@@ -680,8 +749,8 @@ def pretrain(network, device, cfg, optimizer, ema):
                 save_checkpoint(network, optimizer, cfg, ema)
                 tqdm.write(f"Saved {summary['trained_positions']:,} training positions | epoch {epoch}, "
                            f"position {current['positions']:,} | train NLL {window['nll']:.4f} | "
-                           f"EMA preview NLL {preview['nll']:.4f}, top-1 {preview['accuracy']:.1%}, "
-                           f"value BCE {preview['value_bce']:.4f}")
+                           f"EMA preview NLL {preview['nll']:.4f}, value BCE {preview['value_bce']:.4f}, "
+                           f"{outcome_rates(preview)}")
                 while next_save <= summary["trained_positions"]:
                     next_save += cfg.save_every_positions
                 report_positions, report_sums = current["positions"], dict(current["sums"])
@@ -695,9 +764,9 @@ def pretrain(network, device, cfg, optimizer, ema):
                              positions=summary["trained_positions"]))
             network.training_progress = None
             progress = None
-            print(f"epoch {epoch} | train NLL {training['nll']:.4f}, top-1 {training['accuracy']:.1%} | "
-                  f"EMA held-out NLL {evaluation['nll']:.4f}, top-1 {evaluation['accuracy']:.1%}, "
-                  f"value BCE {evaluation['value_bce']:.4f}")
+            print(f"epoch {epoch} | train NLL {training['nll']:.4f}, value BCE {training['value_bce']:.4f}, "
+                  f"{outcome_rates(training)} | EMA held-out NLL {evaluation['nll']:.4f}, "
+                  f"value BCE {evaluation['value_bce']:.4f}, {outcome_rates(evaluation)}")
             save_checkpoint(network, optimizer, cfg, ema)
             print(f"Checkpoint (epoch {epoch}): {checkpoint_path(cfg)}")
             if cfg.show_plots:
@@ -738,8 +807,8 @@ def read_checkpoint(path, device):
     return saved
 
 
-def load_checkpoint(network, optimizer, device, cfg, ema=None):
-    saved = read_checkpoint(checkpoint_path(cfg), "cpu")
+def read_training_checkpoint(path, cfg):
+    saved = read_checkpoint(path, "cpu")
     if saved["model_version"] != MODEL_VERSION:
         raise ValueError(
             "This checkpoint uses a legacy architecture. Select a new path for policy/value training.")
@@ -750,6 +819,11 @@ def load_checkpoint(network, optimizer, device, cfg, ema=None):
                              "A wider model requires a fresh checkpoint path.")
     if saved.get("pool") is not None:
         raise ValueError("Use a pretrained checkpoint to resume historical-game training.")
+    return saved
+
+
+def load_checkpoint(network, optimizer, device, cfg, ema=None):
+    saved = read_training_checkpoint(checkpoint_path(cfg), cfg)
     network.load_state_dict(saved["model"])
     if ema is not None:
         ema.load_state_dict(saved["ema_model"])
@@ -836,11 +910,20 @@ def main():
     ema = deepcopy(network).eval().requires_grad_(False) if cfg.mode != "test" else None
     optimizer = torch.optim.AdamW(network.parameters(), lr=cfg.pretrain_learning_rate,
                                   weight_decay=cfg.weight_decay)
-    if cfg.resume and checkpoint_path(cfg).is_file():
+    destination = checkpoint_path(cfg)
+    source = base_checkpoint_path(cfg)
+    if cfg.resume and destination.is_file():
         load_checkpoint(network, optimizer, device, cfg, ema)
-        print("Resumed:", checkpoint_path(cfg))
+        print("Resumed:", destination)
+    elif (cfg.resume and ema is not None and cfg.pretrain_run_name
+          and not cfg.pretrain_checkpoint_path and source.is_file()):
+        saved = read_training_checkpoint(source, cfg)
+        network.load_state_dict(saved["ema_model"])
+        ema.load_state_dict(saved["ema_model"])
+        del saved
+        print(f"Initialized from EMA weights in {source}; new run writes to {destination}")
     elif cfg.resume:
-        print("No checkpoint at", checkpoint_path(cfg), "— starting fresh; existing models are preserved.")
+        print("No checkpoint at", destination, "— starting fresh; existing models are preserved.")
     print(f"Device: {device} | {sum(p.numel() for p in network.parameters()):,} parameters")
     if cfg.mode == "test":
         quick_test(network, device, cfg)

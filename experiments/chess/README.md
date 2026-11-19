@@ -28,19 +28,18 @@ in the network input.
 
 ## More historical games, bounded RAM
 
-`pretrain_months` defaults to January, February and March 2013. Together these
+`pretrain_months` defaults to all twelve months of 2013. The
 [Lichess monthly archives](https://database.lichess.org/#standard_games) contain
-404K games before filtering and total about 60 MB compressed. They are CC0.
+about 3.39 million games before filtering and total about 512 MB compressed. They are CC0.
 `WhiteElo`/`BlackElo` contain Lichess Glicko-2 ratings, not FIDE Elo. These old
-archives are a small starting point; add any available `YYYY-MM` month to the
-tuple for more data. Recent months can be much larger downloads.
+archives can be supplemented with any available `YYYY-MM` month. Recent months
+can be much larger downloads.
 
-The new default accepts up to **100,000 games across all archives**, compared to
-5,000 games / 250,000 positions previously. The old position cap is removed:
-`pretrain_max_positions = None`. Both players must meet `pretrain_min_rating`
+`pretrain_max_games` caps the number of accepted, unique games across all input
+files combined. It defaults to `None`, as does `pretrain_max_positions`.
+Both players must meet `pretrain_min_rating`
 (default 100, so the dataset includes a broad range of playing strengths).
-Set `pretrain_max_games = None` to use every qualifying game in
-the configured files. These are total dataset limits, not limits per archive.
+The importer scans the configured files in order when a cap is set.
 
 Downloaded files stay compressed under `data/chess/`. On first use, the importer
 encodes games into compressed NumPy shards under `data/chess/pgn_cache/`.
@@ -81,23 +80,28 @@ At 600 positions/second, 100,000 training positions take about 2.8 minutes,
 plus preview, plotting and disk-write overhead.
 
 Each intermediate update evaluates a fixed held-out prefix of at most
-`preview_positions = 2_048` positions. The progress plot shows recent training
-NLL/accuracy and this validation preview against cumulative training positions.
+`preview_positions = 2_048` positions. The plots show unweighted policy NLL and
+value BCE, plus legal top-1 agreement on winners' plies and disagreement on
+losers' plies. Draws only contribute to the losses in these plots.
 It reuses one nonblocking window so training continues. Each epoch still performs
 full held-out validation and shows its epoch curves. Close epoch/endgame figures
 to continue if your backend blocks. Final plots compare human and model moves in
 held-out positions. Use `show_plots = False` for headless runs.
-Accuracy measures agreement with human moves, not chess playing strength.
+The agreement rates describe recorded moves and game outcomes. In particular,
+loser disagreement counts every alternative legal move equally.
 
 `resume = True` restores weights, optimizer moments, RNG state and the shuffled
 data cursor, continuing inside the epoch from the saved batch. Only work since
 the latest checkpoint is discarded after an interruption. Resuming a partial
 epoch requires the same dataset and filter settings. Otherwise the program stops
 instead of silently applying the old cursor to different data. Training starts
-fresh if no checkpoint exists. The default is
-`data/chess/chess_rope_value_d1024_b8_h8.pt` and can be overridden with
-`pretrain_checkpoint_path`. Training resumes from a matching fixed-depth
-checkpoint. The live weights train with the optimizer. A separate EMA copy
+fresh when no matching checkpoint exists. The default run writes
+`data/chess/chess_rope_value_d1024_b8_h16_elo_weighted.pt`. On its first run, if
+the unsuffixed checkpoint exists, its EMA weights initialize the network and the
+new EMA copy. The new run starts with fresh optimizer state, metric history and
+data cursor. `pretrain_checkpoint_path` overrides the output path.
+The default batch size is 512 and AdamW uses a learning rate of `1e-4`.
+The live weights train with the optimizer. A separate EMA copy
 updates after each step using decay `ema_decay = 0.999`. Checkpoints keep both
 copies, and validation and play use the EMA weights. `play.py` also loads
 the original rotary policy checkpoints.
@@ -109,7 +113,8 @@ The game-hash split remains stable.
 
 ## Rating-based outcome weighting
 
-The outcome weighting uses the masked move likelihood:
+The outcome weighting uses the masked move likelihood. Both heads use the
+mover's rating as a per-position weight:
 
 ```
 E_white = 1 / (1 + 10 ** ((black_rating - white_rating) / 400))
@@ -119,7 +124,9 @@ logits = policy(board) / temperature
 nll = -log softmax(legal_mask(logits))[human_move]
 surprise_loss = A * nll                     if A >= 0
                 A * min(nll, log_cap)       if A < 0
-loss = imitation_weight * nll + advantage_weight * surprise_loss + value_loss_weight * value_bce
+position_loss = imitation_weight * nll + advantage_weight * surprise_loss + value_loss_weight * value_bce
+weight = mover_rating / 100
+batch_loss = sum(weight * position_loss) / sum(weight)
 ```
 
 This is offline imitation with a bounded signed game-outcome term. Human action
@@ -134,7 +141,7 @@ sufficiently large upsets reverse it, while the negative term saturates at
 ## Play and evaluation
 
 Run `play.py`, then open <http://127.0.0.1:8000>. It selects the configured
-configured architecture's checkpoint if present, then tries the older checkpoint
+run's checkpoint if present, then tries the unsuffixed and older checkpoint
 paths. Set `CHECKPOINT_PATH` explicitly to compare models.
 The browser shows the saved epoch or intermediate position and held-out accuracy.
 `MODE = "training"` shows the training curves without starting the web server.

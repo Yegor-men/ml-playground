@@ -68,12 +68,24 @@ class PretrainingTests(unittest.TestCase):
         self.assertTrue(dataset.examples)
 
     def test_multiple_files_dedup_and_stable_game_splits(self):
-        second = self.path / "other.pgn"
-        second.write_text(self.pgn)
+        second = self.path / "other.pgn.gz"
+        second.write_bytes(gzip.compress(self.pgn.encode()))
         sources = [(Path(self.cfg.pretrain_pgn), ""), (second, "")]
-        cfg = replace(self.cfg, pretrain_max_games=None)
-        with patch.object(training, "pgn_sources", return_value=sources):
+        cfg = replace(self.cfg, pretrain_max_games=None, pretrain_max_positions=None)
+        tqdm = training.tqdm
+        bars = []
+
+        def track_progress(**kwargs):
+            bar = tqdm(**kwargs)
+            bars.append(bar)
+            return bar
+
+        with patch.object(training, "pgn_sources", return_value=sources), \
+                patch.object(training, "tqdm", side_effect=track_progress):
             dataset = training.prepare_pretraining(cfg)
+        archive_bytes = sum(path.stat().st_size for path, _ in sources)
+        self.assertEqual((bars[0].n, bars[0].total, bars[0].unit), (archive_bytes, archive_bytes, "B"))
+        self.assertIn("60 scanned, 30 kept", bars[0].postfix)
         self.assertEqual(dataset.manifest["counts"]["duplicates"], 30)
         self.assertEqual(dataset.manifest["counts"]["accepted"], 30)
         # Reversing archive order doesn't change split membership.
@@ -121,6 +133,9 @@ class PretrainingTests(unittest.TestCase):
         path.write_bytes(zstd.compress(self.pgn.encode()))
         with training.open_pgn(path) as source:
             self.assertEqual(source.read(), self.pgn)
+        with path.open("rb") as raw, training.open_pgn(path, raw) as source:
+            self.assertEqual(source.read(), self.pgn)
+            self.assertEqual(raw.tell(), path.stat().st_size)
 
     def test_signed_gradient_and_bounded_negative_term(self):
         nll = torch.tensor([1., 1., 20.], requires_grad=True)
@@ -138,6 +153,31 @@ class PretrainingTests(unittest.TestCase):
                 "train", batch_size, shuffle=True, seed=123, start=start) for p, a in zip(ps, actions)]
 
         self.assertEqual(sequence(47, 17), sequence(0, 32)[47:])
+
+    def test_rating_weights_both_heads_and_metrics_use_the_movers_result(self):
+        cfg = replace(self.cfg, pretrain_advantage_weight=0.)
+        device = torch.device("cpu")
+        network = training.ChessPolicy(cfg).eval()
+        logits = torch.zeros(5, training.NUM_ACTIONS)
+        logits[:, 0] = torch.tensor([1., -1., -1., 1., 1.])
+        values = torch.tensor([.5, -.3, .1, .6, -.4])
+        metadata = np.zeros((5, training.META_SIZE), dtype=np.float32)
+        metadata[:, training.SIDE_TO_MOVE_INDEX] = [1, -1, 1, -1, 1]
+        ratings = np.array([1000, 2000, 1500, 1200, 1800], dtype=np.uint16)
+        scores = np.array([1., 0., 0., 1., .5], dtype=np.float32)
+        batch = (np.zeros((5, 64), dtype=np.uint8), metadata, np.zeros(5, dtype=np.uint16),
+                 np.zeros(5, dtype=np.float32), [np.array([0, 1])] * 5, ratings, scores)
+        dataset = training.PGNDataset(self.path, {"positions": {"validation": 5}})
+        with patch.object(dataset, "batches", return_value=[batch]), \
+                patch.object(network, "forward", return_value=(logits, values)):
+            metrics = training.pretraining_epoch(network, None, dataset, device, cfg)
+        nll = -logits[:, :2].log_softmax(-1)[:, 0]
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(values, torch.from_numpy(scores), reduction="none")
+        weights = ratings / ratings.sum()
+        self.assertAlmostEqual(metrics["loss"], np.dot(weights, (nll + bce).numpy()), places=6)
+        self.assertAlmostEqual(metrics["value_bce"], bce.mean().item(), places=6)
+        self.assertEqual(metrics["winner_match"], .5)
+        self.assertEqual(metrics["loser_disagree"], .5)
 
     def test_intermediate_save_and_exact_resume_with_dropout(self):
         cfg = replace(self.cfg, dropout=.1, save_every_positions=64, preview_positions=16)
@@ -175,9 +215,12 @@ class PretrainingTests(unittest.TestCase):
         network = training.ChessPolicy(self.cfg).eval()
         player = play.Player(network, self.cfg, torch.device("cpu"))
         player.action("/move", dict(move="e2e4"))
-        player.action("/move", dict(move="e7e5"))
+        state = player.action("/move", dict(move="e7e5"))
+        self.assertEqual(state["history"], [dict(number=1, white="e4", black="e5")])
+        self.assertEqual(state["movetext"], "1. e4 e5 *")
         state = player.action("/undo", {})
         self.assertEqual(state["plies"], 1)
+        self.assertEqual(state["history"], [dict(number=1, white="e4", black=None)])
         self.assertEqual(player.board.turn, chess.BLACK)
         player.action("/control", dict(side="white"))
         with self.assertRaisesRegex(ValueError, "model's turn"):
@@ -188,11 +231,18 @@ class PretrainingTests(unittest.TestCase):
             state = player.action("/position", dict(fen=fen))
             self.assertFalse(state["ended"])
             self.assertEqual(state["plies"], 0)
+            self.assertEqual(state["history"], [])
             self.assertTrue(state["moves"])
+        black_fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 17"
+        player.action("/position", dict(fen=black_fen))
+        state = player.action("/move", dict(move="e7e5"))
+        self.assertEqual(state["history"], [dict(number=17, white=None, black="e5")])
+        self.assertEqual(state["movetext"], "17... e5 *")
         fen = "7k/5K2/6Q1/8/8/8/8/8 w - - 0 1"
         player.action("/position", dict(fen=fen))
         state = player.action("/move", dict(move="g6g7"))
         self.assertTrue(state["ended"])
+        self.assertEqual(state["movetext"], "1. Qg7# 1-0")
         self.assertTrue(player.board.is_checkmate())
         player.action("/undo", {})
         self.assertEqual(player.board.fen(), fen)
@@ -237,6 +287,33 @@ class PretrainingTests(unittest.TestCase):
             training.main()
         saved = training.read_checkpoint(training.checkpoint_path(self.cfg), "cpu")
         self.assertEqual(saved["pretraining"]["history"][-1]["epoch"], 1)
+
+    def test_named_run_warm_starts_from_ema_and_preserves_original(self):
+        base = replace(self.cfg, pretrain_checkpoint_path="", pretrain_run_name="")
+        device = torch.device("cpu")
+        source_model = training.ChessPolicy(base)
+        source_ema = training.ChessPolicy(base)
+        optimizer = torch.optim.AdamW(source_model.parameters())
+        training.save_checkpoint(source_model, optimizer, base, source_ema)
+        source = training.checkpoint_path(base)
+        original = source.read_bytes()
+        cfg = replace(base, pretrain_run_name="elo_weighted", resume=True)
+        pretrain = training.pretrain
+
+        def check_initialization(network, device, cfg, optimizer, ema):
+            for key, weights in source_ema.state_dict().items():
+                torch.testing.assert_close(network.state_dict()[key], weights, rtol=0, atol=0)
+                torch.testing.assert_close(ema.state_dict()[key], weights, rtol=0, atol=0)
+            self.assertEqual(len(optimizer.state), 0)
+            self.assertIsNone(getattr(network, "training_progress", None))
+            pretrain(network, device, cfg, optimizer, ema)
+
+        with patch.object(training, "CONFIG", cfg), \
+                patch.object(training, "pretrain", side_effect=check_initialization):
+            training.main()
+        self.assertEqual(source.read_bytes(), original)
+        saved = training.read_checkpoint(training.checkpoint_path(cfg), device)
+        self.assertEqual(saved["pretraining"]["history"][0]["epoch"], 1)
 
     def test_projection_masks_and_special_moves(self):
         model = training.ChessPolicy(self.cfg)
@@ -322,6 +399,34 @@ class PretrainingTests(unittest.TestCase):
             rng.choice.assert_called_once()
         self.assertEqual(evaluated, [chess.STARTING_FEN])
         self.assertEqual(player.board.move_stack, [moves[1]])
+
+    def test_move_scores_batch_nonterminal_successors_and_use_exact_results(self):
+        network = training.ChessPolicy(self.cfg).eval()
+        player = play.Player(network, self.cfg, torch.device("cpu"))
+        fen = "7k/5K2/8/6Q1/8/8/8/8 w - - 0 1"
+        player.board = chess.Board(fen)
+        moves = [chess.Move.from_uci(uci) for uci in ("g5g6", "g5g7", "g5g4", "g5e5")]
+        logits = np.zeros(training.NUM_ACTIONS)
+        logits[[training.action_index(move) for move in moves]] = [4., 3., 2., 1.]
+        value_logits = torch.logit(torch.tensor([.75, .25]))
+        with patch.object(player, "evaluate_position", return_value=(moves, logits, .6)), \
+                patch.object(network, "forward", return_value=(None, value_logits)) as forward:
+            state = player.action("/state", {})
+            refreshed = player.action("/state", {"sampling": {"temperature": 0.}})
+        forward.assert_called_once()
+        positions = [chess.Board(fen) for _ in moves[2:]]
+        for board, move in zip(positions, moves[2:]):
+            board.push(move)
+        for actual, expected in zip(forward.call_args.args, training.encode_batch(positions, player.device)):
+            torch.testing.assert_close(actual, expected)
+        self.assertEqual(state["white_score"], .6)
+        self.assertEqual([row["move"] for row in state["rows"]], ["Qg6", "Qg7#", "Qg4", "Qe5+"])
+        scores = [row["white_score"] for row in state["rows"]]
+        self.assertEqual(scores[:2], [.5, 1.])
+        np.testing.assert_allclose(scores[2:], [.75, .25], atol=1e-7)
+        self.assertEqual(scores, [row["white_score"] for row in refreshed["rows"]])
+        self.assertEqual(player.board.fen(), fen)
+        self.assertFalse(player.board.move_stack)
 
     def test_exact_terminal_scores(self):
         network = training.ChessPolicy(self.cfg).eval()

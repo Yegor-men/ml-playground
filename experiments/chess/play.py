@@ -24,14 +24,15 @@ import torch
 
 from main import (ChessPolicy, Config, action_index, encode_batch, game_result,
                   legal_moves, read_checkpoint, plot_history, checkpoint_path,
-                  ARCHITECTURE_KEYS, LEGACY_MODEL_VERSION)
+                  base_checkpoint_path, ARCHITECTURE_KEYS, LEGACY_MODEL_VERSION)
 
 # SETTINGS
 DIRECTORY = Path(__file__).resolve().parent
 CHECKPOINT_PATH = checkpoint_path(Config())
 if not CHECKPOINT_PATH.is_file():
-    for name in (f"chess_pretrained_d{Config().dim}.pt", "chess_pretrained.pt"):
-        candidate = CHECKPOINT_PATH.parent / name
+    for candidate in (base_checkpoint_path(Config()),
+                      CHECKPOINT_PATH.parent / f"chess_pretrained_d{Config().dim}.pt",
+                      CHECKPOINT_PATH.parent / "chess_pretrained.pt"):
         if candidate.is_file():
             CHECKPOINT_PATH = candidate
             break
@@ -117,6 +118,13 @@ def probabilities(values, options):
     return weights / weights.sum()
 
 
+def terminal_white_score(board, rules):
+    ended, winner = game_result(board, rules)
+    if ended:
+        return .5 if winner is None else float(winner == chess.WHITE)
+    return None
+
+
 class Player:
     def __init__(self, network, cfg, device):
         self.network, self.cfg, self.device = network, cfg, device
@@ -125,6 +133,7 @@ class Player:
         self.rng = np.random.default_rng(SEED)
         self.cached_fen = None
         self.cached_analysis = None
+        self.cached_move_scores = None
         self.last_model = ""
 
     def evaluate(self, options=None):
@@ -135,14 +144,15 @@ class Player:
         key = (self.board.fen(), tuple(self.board.move_stack))
         if key != self.cached_fen:
             self.cached_analysis = self.evaluate_position(self.board)
+            self.cached_move_scores = None
             self.cached_fen = key
         return self.cached_analysis
 
     @torch.inference_mode()
     def evaluate_position(self, board):
-        ended, winner = game_result(board, self.cfg.rules)
-        if ended:
-            return [], np.array([]), .5 if winner is None else float(winner == chess.WHITE)
+        white_score = terminal_white_score(board, self.cfg.rules)
+        if white_score is not None:
+            return [], np.array([]), white_score
         moves = legal_moves(board, self.cfg.rules)
         inputs = encode_batch([board], self.device)
         if self.network.has_value:
@@ -151,6 +161,25 @@ class Player:
         else:
             logits, white_score = self.network(*inputs), None
         return moves, logits[0].cpu().numpy(), white_score
+
+    @torch.inference_mode()
+    def evaluate_successors(self, moves):
+        scores = []
+        positions = []
+        pending = []
+        for move in moves:
+            board = self.board.copy()  # Preserve repetition history for draw claims.
+            board.push(move)
+            score = terminal_white_score(board, self.cfg.rules)
+            if score is None and self.network.has_value:
+                pending.append(len(scores))
+                positions.append(board)
+            scores.append(score)
+        if positions:
+            _, values = self.network(*encode_batch(positions, self.device), with_value=True)
+            for i, score in zip(pending, values.sigmoid().tolist()):
+                scores[i] = score
+        return scores
 
     def model_move(self, options):
         moves, values = self.evaluate()
@@ -169,11 +198,14 @@ class Player:
         legal_indices = [action_index(move) for move in moves]
         scores = raw_scores[legal_indices]
         probs = probabilities(scores, options)
-        order = np.argsort(-scores, kind="stable")
+        order = np.argsort(-scores, kind="stable")[:12]
+        if self.cached_move_scores is None:
+            self.cached_move_scores = self.evaluate_successors([moves[i] for i in order])
         rows = []
-        for i in order[:12]:
+        for i, move_score in zip(order, self.cached_move_scores):
             move = moves[i]
-            rows.append(dict(move=self.board.san(move), logit=float(scores[i]), p=float(probs[i])))
+            rows.append(dict(move=self.board.san(move), logit=float(scores[i]), p=float(probs[i]),
+                             white_score=move_score))
         pieces = self.board.piece_map()
         origin_types = {square: "white" if piece.color else "black" for square, piece in pieces.items()}
         legal_actions = set(legal_indices)
@@ -205,12 +237,21 @@ class Player:
         game = chess.pgn.Game.from_board(self.board)
         if ended:
             game.headers["Result"] = "1/2-1/2" if winner is None else "1-0" if winner else "0-1"
+        history = []
+        position = game.board()
+        for move in game.mainline_moves():
+            if position.turn == chess.WHITE or not history:
+                history.append(dict(number=position.fullmove_number, white=None, black=None))
+            side = "white" if position.turn == chess.WHITE else "black"
+            history[-1][side] = position.san(move)
+            position.push(move)
+        movetext = game.accept(chess.pgn.StringExporter(headers=False, comments=False, variations=False, columns=None))
         return dict(fen=self.board.fen(), pieces={chess.square_name(s): p.symbol() for s, p in pieces.items()},
                     moves=[move.uci() for move in moves],
                     last=self.board.peek().uci() if self.board.move_stack else "",
                     status=status, ended=ended, turn=self.board.turn, human=self.human,
                     rows=rows, raw_rows=raw_rows, last_model=self.last_model, pgn=str(game),
-                    history=game.accept(chess.pgn.StringExporter(headers=False, comments=False, variations=False)),
+                    history=history, movetext=movetext,
                     plies=len(self.board.move_stack), rules=self.cfg.rules,
                     training=training_summary(self.network), white_score=white_score)
 
@@ -253,8 +294,9 @@ PAGE = r'''<!doctype html>
 <title>Chess policy · Play the checkpoint</title>
 <style>
 *{box-sizing:border-box}body{margin:0;background:#121a21;color:#e7ede9;font:15px system-ui,sans-serif}
-main{max-width:1250px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{color:#a8b8bc;line-height:1.5}
-.layout{display:grid;grid-template-columns:minmax(280px,610px) minmax(480px,1fr);gap:28px;margin-top:24px}
+main{max-width:1400px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{color:#a8b8bc;line-height:1.5}
+.layout{display:grid;grid-template-columns:minmax(0,790px) minmax(480px,1fr);gap:24px;margin-top:24px;align-items:start}
+.playArea{display:grid;grid-template-columns:minmax(150px,174px) minmax(0,610px);gap:16px;align-items:start}
 #board{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));grid-template-rows:repeat(8,minmax(0,1fr));width:100%;aspect-ratio:1;touch-action:none;user-select:none}
 .square{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0;background:#e1dbc8;color:#283d36}
 .square.dark{background:#698b7c}.square img{position:absolute;inset:4%;width:92%;height:92%;object-fit:contain;pointer-events:none}.square.selected{box-shadow:inset 0 0 0 5px #e4b853}
@@ -265,7 +307,8 @@ main{max-width:1250px;margin:auto;padding:28px}h1{margin:0;font-size:28px}p{colo
 button,select,input[type=text]{background:#2a3c47;color:#eef4ef;border:1px solid #4c646b;padding:9px;border-radius:6px;font:inherit}
 button{cursor:pointer}button:disabled{opacity:.4;cursor:wait}.buttons{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
 input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{text-align:right;padding:5px;border-bottom:1px solid #35454e}th:first-child,td:first-child{text-align:left}
-.scoreColumns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.scoreColumns{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px}
+.scoreDelta{display:block;white-space:nowrap}
 .originFilters{display:flex;flex-wrap:wrap;gap:4px 10px;margin:6px 0}
 .originFilters label{display:flex;align-items:center;gap:3px;margin:0}
 .rawScores{max-height:380px;overflow:auto}
@@ -276,30 +319,51 @@ input[type=text]{width:100%}table{width:100%;border-collapse:collapse;font-varia
 #evalFill{height:100%;background:#f0eee5}
 #evalText{margin:4px 0 0}
 #status{font-size:20px;margin:14px 0}#error{color:#ffb5a6;min-height:24px}.small{font-size:12px;color:#a8b8bc}
-#history{background:#1c2831;padding:12px;border-radius:8px;min-height:3em;max-height:160px;overflow:auto;white-space:pre-wrap;font:inherit;line-height:1.6}
-@media(max-width:900px){main{padding:16px}.layout{grid-template-columns:1fr}}
+.historyPanel{background:#1c2831;padding:12px;border-radius:8px;min-width:0}
+#historyScroll{max-height:min(56vh,540px);overflow:auto;margin:8px 0}
+.historyPanel th,.historyPanel td{text-align:left;padding:5px 4px;white-space:nowrap;font-size:13px}
+.historyPanel th{position:sticky;top:0;background:#1c2831}
+.historyPanel td:first-child{color:#a8b8bc}
+#copyHistory{width:100%;font-size:13px}
+#copyHistory:disabled{cursor:default}
+#copyStatus{margin:0}
+#copyStatus:not(:empty){margin-top:6px}
+@media(max-width:1070px){main{padding:16px}.layout{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:570px){.playArea{grid-template-columns:minmax(0,1fr)}.boardPanel{grid-row:1}#historyScroll{max-height:200px}}
 @media(max-width:540px){.scoreColumns{grid-template-columns:1fr}}
 </style>
 <main><h1>Chess policy <span class="small">/ play the checkpoint</span></h1>
 <p id="training" class="small"></p>
 <p>Drag a piece or click its square, then its destination.</p>
-<div class="layout"><section><div id="board"></div><div id="evalBar" role="meter" aria-label="White expected score" aria-valuemin="0" aria-valuemax="100" hidden><div id="evalFill"></div></div><p id="evalText" class="small"></p><div id="status"></div><div id="error" role="alert"></div>
-<strong>Game history</strong><pre id="history"></pre>
-<div class="buttons"><select id="side" aria-label="Sides to control"><option value="both">Control both sides</option><option value="white">Play as White</option><option value="black">Play as Black</option></select><button id="new">New game</button><button id="undo">Undo ply</button><button id="flip">Flip board</button><button id="download">Save PGN</button></div>
+<div class="layout">
+<div class="playArea">
+<section class="historyPanel" aria-labelledby="historyHeading">
+<strong id="historyHeading">Game history</strong>
+<div id="historyScroll" tabindex="0" role="region" aria-labelledby="historyHeading">
+<table><thead><tr><th scope="col">No.</th><th scope="col">White</th><th scope="col">Black</th></tr></thead><tbody id="history"></tbody></table>
+</div>
+<button id="copyHistory" type="button" disabled>Copy moves</button>
+<p id="copyStatus" class="small" role="status"></p>
+</section>
+<section class="boardPanel">
+<div id="board"></div>
+<div class="buttons" role="group" aria-label="Board controls"><select id="side" aria-label="Sides to control"><option value="both">Control both sides</option><option value="white">Play as White</option><option value="black">Play as Black</option></select><button id="new">New game</button><button id="undo">Undo ply</button><button id="flip">Flip board</button><button id="model">Make model move</button><button id="download">Save PGN</button></div>
+<div id="evalBar" role="meter" aria-label="White expected score" aria-valuemin="0" aria-valuemax="100" hidden><div id="evalFill"></div></div><p id="evalText" class="small"></p><div id="status"></div><div id="error" role="alert"></div>
 <label>Position (FEN)</label><input id="fen" type="text"><div class="buttons"><button id="load">Load position</button></div>
 <label>Endgame examples</label><select id="endgame"><option value="">Choose a position</option></select>
 <p class="small">Paste any valid FEN to configure pieces and the side to move. Loading a position resets move history.</p>
 </section>
+</div>
 <section class="panel"><strong>Move sampling</strong>
 <label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="100" step="any">
 <label for="min_p">Min-p (0–1)</label><input id="min_p" type="number" min="0" max="1" step="any">
 <p class="small">The model samples from legal moves on the current board. Min-p keeps moves at least this fraction as likely as the favourite.</p>
 <label><input id="auto" type="checkbox" checked> Model replies automatically</label>
-<div class="buttons"><button id="model">Make model move</button><button id="refresh">Refresh scores</button></div>
+<div class="buttons"><button id="refresh">Refresh scores</button></div>
 <p id="modelInfo" class="small"></p>
 <div class="scoreColumns">
 <div><strong>Top legal moves</strong>
-<table><thead><tr><th>Move</th><th>Policy logit</th><th>P (filtered)</th></tr></thead><tbody id="scores"></tbody></table>
+<table><thead><tr><th>Move</th><th>Policy logit</th><th>P (filtered)</th><th>White score after move</th></tr></thead><tbody id="scores"></tbody></table>
 </div>
 <div><strong id="rawHeading">Top raw logits</strong>
 <div id="originFilters" class="originFilters small" role="group" aria-label="Include moves from">
@@ -318,6 +382,7 @@ const $=id=>document.getElementById(id);
 let state=null,flipped=false,selected=null,busy=false,drag=null;
 const fields=['temperature','min_p'];
 const originFilters=[...document.querySelectorAll('#originFilters input')];
+const gameButtons=document.querySelectorAll('button:not(#copyHistory)');
 const rawLogitRows=__RAW_LOGIT_ROWS__;
 function sampling(){return Object.fromEntries(fields.map(id=>[id,$(id).valueAsNumber]));}
 function scoreRow(cells){
@@ -334,6 +399,20 @@ function renderRawScores(){
   if(row.legal)tr.lastElementChild.className='legalPair';
   return tr;
  }));
+}
+function renderHistory(){
+ const history=$('history');
+ if(state.history.length){
+  history.replaceChildren(...state.history.map(({number,white,black})=>scoreRow([number,white??'',black??''])));
+ }else{
+  const row=scoreRow(['No moves yet']);
+  row.firstElementChild.colSpan=3;
+  history.replaceChildren(row);
+ }
+ const scroll=$('historyScroll');
+ scroll.scrollTop=scroll.scrollHeight;
+ $('copyHistory').disabled=!state.history.length;
+ $('copyStatus').textContent='';
 }
 function render(){
  if(!state)return;
@@ -360,20 +439,30 @@ function render(){
   $('evalText').textContent=`${state.ended?'Final White score':'White expected score'} ${percent}%`;
  }else $('evalText').textContent='';
  $('details').textContent=`${state.rules} · ${state.plies} half-moves played · automatic queen promotion`;
- $('history').textContent=state.plies?state.history:'No moves yet';
- $('history').scrollTop=$('history').scrollHeight;
- $('scores').replaceChildren(...state.rows.map(row=>scoreRow([row.move,row.logit.toFixed(3),(100*row.p).toFixed(1)+'%'])));
+ $('scores').replaceChildren(...state.rows.map(row=>{
+  const score=row.white_score===null?'—':(100*row.white_score).toFixed(1)+'%';
+  const tr=scoreRow([row.move,row.logit.toFixed(3),(100*row.p).toFixed(1)+'%',score]);
+  if(row.white_score!==null&&state.white_score!==null){
+   const points=Number((100*(row.white_score-state.white_score)).toFixed(1));
+   const delta=document.createElement('span');
+   delta.className='scoreDelta small';
+   delta.textContent=(points>0?'+':'')+points.toFixed(1)+' pp';
+   delta.title='Change from the current White score in percentage points';
+   tr.lastElementChild.append(delta);
+  }
+  return tr;
+ }));
  renderRawScores();
 }
 async function request(path,extra={}){
  const response=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sampling:sampling(),...extra})});
- const data=await response.json();if(!response.ok)throw Error(data.error);state=data;selected=null;render();
+ const data=await response.json();if(!response.ok)throw Error(data.error);state=data;selected=null;render();renderHistory();
 }
 async function run(path,extra={},reply=false){
- if(busy)return;busy=true;$('error').textContent='';document.querySelectorAll('button').forEach(b=>b.disabled=true);
+ if(busy)return;busy=true;$('error').textContent='';gameButtons.forEach(b=>b.disabled=true);
  try{await request(path,extra);if(reply&&$('auto').checked&&state.human!==null&&!state.ended&&state.turn!==state.human)await request('/model');}
  catch(e){$('error').textContent=e.message}
- finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false)}
+ finally{busy=false;gameButtons.forEach(b=>b.disabled=false)}
 }
 function movable(sq){return state&&!state.ended&&(state.human===null||state.turn===state.human)&&state.moves.some(m=>m.slice(0,2)===sq)}
 function destination(sq){
@@ -406,6 +495,14 @@ for(const input of originFilters)input.onchange=renderRawScores;
 const endgames=__ENDGAMES__;
 for(const [name,fen] of Object.entries(endgames)){const option=document.createElement('option');option.value=fen;option.textContent=name;$('endgame').append(option)}
 $('endgame').onchange=()=>{const fen=$('endgame').value;$('endgame').value='';if(fen)run('/position',{fen})};
+$('copyHistory').onclick=async()=>{
+ try{
+  await navigator.clipboard.writeText(state.movetext);
+  $('copyStatus').textContent='Copied to clipboard';
+ }catch{
+  $('copyStatus').textContent='Clipboard unavailable. Select the moves to copy.';
+ }
+};
 $('download').onclick=()=>{const url=URL.createObjectURL(new Blob([state.pgn+'\n'],{type:'application/x-chess-pgn'}));const a=document.createElement('a');a.href=url;a.download='chessq.pgn';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 const defaults=__SAMPLING__;
 for(const id of fields)$(id).value=defaults[id];
